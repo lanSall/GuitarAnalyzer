@@ -47,6 +47,7 @@ class FretboardWidget(QWidget):
         self.setMinimumHeight(300)
         self.strings = []
         self.now = 0.0
+        self.quality_text = QUALITY_TEXT
 
     def set_state(self, strings, now):
         self.strings = strings
@@ -138,7 +139,7 @@ class FretboardWidget(QWidget):
         p.drawText(QRectF(px, y - 22, 130, 20), Qt.AlignLeft | Qt.AlignVCenter, text)
         p.setFont(QFont("Segoe UI", 9, QFont.Bold))
         p.drawText(QRectF(px + 130, y - 22, 100, 20), Qt.AlignLeft | Qt.AlignVCenter,
-                   QUALITY_TEXT[st.quality if active else "idle"])
+                   self.quality_text[st.quality if active else "idle"])
         bar_w = self.PANEL_W - 24
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#1f2937"))
@@ -187,7 +188,7 @@ class MainWindow(QMainWindow):
         header.addWidget(self.chord_label)
 
         mid = QVBoxLayout()
-        self.detail_label = QLabel("Waiting for a strum…")
+        self.detail_label = QLabel("Play open strings one at a time. Low E should peak near the 82 Hz tick.")
         self.detail_label.setFont(QFont("Segoe UI", 13))
         self.mistake_label = QLabel("")
         self.mistake_label.setFont(QFont("Segoe UI", 13, QFont.Bold))
@@ -236,8 +237,13 @@ class MainWindow(QMainWindow):
         sp.setYRange(-110, 0, padding=0)
         sp.setLabel("bottom", "frequency (Hz)")
         sp.getAxis("bottom").setTicks([[(np.log10(f), str(f)) for f in (82, 110, 165, 220, 330, 500, 1000, 2000, 5000)]])
-        sp.setTitle("Spectrum (dashed = fundamentals of ringing strings)", color="#94a3b8", size="10pt")
+        sp.setTitle("Spectrum (gray = open strings, dashed = detected fundamentals)", color="#94a3b8", size="10pt")
         self.spec_curve = sp.plot(pen=pg.mkPen("#38bdf8", width=1))
+        for midi in (40, 45, 50, 55, 59, 64):
+            sp.addItem(pg.InfiniteLine(
+                pos=np.log10(float(midi_to_hz(midi))), angle=90,
+                pen=pg.mkPen("#334155", width=1),
+            ))
         self.f0_lines = []
         for i in range(6):
             line = pg.InfiniteLine(angle=90, pen=pg.mkPen(STRING_COLORS[i], width=1.5, style=Qt.DashLine))
@@ -306,6 +312,9 @@ class MainWindow(QMainWindow):
         self.chord_label.setText(self.analyzer.chord)
         self.detail_label.setText(f"{ev.label}    ·    shown {latency_ms:.0f} ms after the pluck")
         for i, fret in ev.frets.items():
+            replaced = self.strike_items.pop(ev.strike_ids[i], None)
+            if replaced:
+                self.timeline.removeItem(replaced[0])
             item = pg.TextItem(str(fret), color=QUALITY_COLORS["ringing"], anchor=(0.5, 0.5))
             item.setFont(QFont("Consolas", 11, QFont.Bold))
             item.setPos(ev.time, i + 0.45)

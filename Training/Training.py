@@ -3,6 +3,7 @@
     python Training\\Training.py                        cross-validate, holding out one guitar at a time
     python Training\\Training.py --test                 train on every development guitar, score hf_deb once
     python Training\\Training.py --val-sessions hf_ele  one custom holdout
+    python Training\\Training.py --save                 train on every clip and save the model for the monitor
 
 Labels use the CSV's numbering: string 1 = high E ... 6 = low E, fret 0 = open. Each Hugging
 Face source is one guitar group and all piezo sessions are another. hf_deb, the only
@@ -19,25 +20,13 @@ from torch import nn
 
 from augment import augment, spec_augment
 from data import ROOT, TEST_GROUP, load_clips, load_rows, midi_of, split_by_groups
-from features import N_HARMONIC_FEATURES, harmonic_features, log_filterbank, spectrogram
+from features import N_HARMONIC_FEATURES, harmonic_stats, log_filterbank, spectrogram, standardized_harmonics
 from model import Fretboard, NoteNet
 
 METRICS = ("exact", "pitch", "string", "string_given_pitch")
 HEADINGS = {"exact": "exact", "pitch": "pitch", "string": "string", "string_given_pitch": "string if pitch ok"}
 EVAL_BATCH = 64
-
-
-def harmonic_stats(clips, midi):
-    """Mean and standard deviation of the harmonic features over a training fold's clips."""
-    feats = torch.cat([harmonic_features(c, m) for c, m in zip(clips.split(EVAL_BATCH), midi.split(EVAL_BATCH))])
-    return feats.mean(dim=0), feats.std(dim=0).clamp(min=1e-3)
-
-
-def harmonic_inputs(audio, midi, stats):
-    if stats is None:
-        return torch.zeros(len(audio), 0)
-    mean, std = stats
-    return (harmonic_features(audio, midi) - mean) / std
+DEFAULT_MODEL = ROOT / "models" / "string_model.pt"
 
 
 def train_fold(rows, clips, bank, args, seed):
@@ -65,7 +54,7 @@ def train_fold(rows, clips, bank, args, seed):
             if args.augment:
                 spec = spec_augment(spec)
             embedding = model.embed(spec)
-            harmonics = harmonic_inputs(audio, midi[b], stats)
+            harmonics = standardized_harmonics(audio, midi[b], stats)
             loss = (loss_fn(model.pitch_head(embedding), pitch[b])
                     + loss_fn(model.string_logits(embedding, harmonics), string[b]))
             optimizer.zero_grad()
@@ -84,9 +73,20 @@ def predict(model, board, stats, clips, bank):
         for audio in clips.split(EVAL_BATCH):
             embedding = model.embed(spectrogram(audio, bank))
             pitch_ids = model.pitch_head(embedding).argmax(dim=1)
-            harmonics = harmonic_inputs(audio, board.pitch_midi(pitch_ids), stats)
+            harmonics = standardized_harmonics(audio, board.pitch_midi(pitch_ids), stats)
             predicted += board.decode(pitch_ids, model.string_logits(embedding, harmonics))
     return predicted
+
+
+def save_model(path, model, board, stats, bank):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "state_dict": model.state_dict(),
+        "positions": [list(p) for p in board.positions],
+        "harmonic_mean": stats[0] if stats else None,
+        "harmonic_std": stats[1] if stats else None,
+        "n_bands": bank.shape[0],
+    }, path)
 
 
 def score(rows, predicted):
@@ -139,6 +139,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--no-augment", dest="augment", action="store_false")
     ap.add_argument("--no-harmonics", dest="harmonics", action="store_false")
+    ap.add_argument("--save", type=Path, nargs="?", const=DEFAULT_MODEL,
+                    help=f"train one model on every clip (seed = first of --seeds) and save it (default {DEFAULT_MODEL})")
     args = ap.parse_args()
 
     rows = [r for d in args.dataset for r in load_rows(d)]
@@ -146,6 +148,14 @@ def main():
         r["idx"] = i
     clips = load_clips(rows)
     bank = log_filterbank()
+
+    if args.save:
+        started = time.perf_counter()
+        model, board, stats = train_fold(rows, clips, bank, args, args.seeds[0])
+        save_model(args.save, model, board, stats, bank)
+        print(f"Trained on all {len(rows)} clips ({len(board.positions)} string/fret positions) in "
+              f"{time.perf_counter() - started:.0f} s; saved {args.save}")
+        return
 
     if args.test:
         folds = {TEST_GROUP: split_by_groups(rows, {TEST_GROUP})}

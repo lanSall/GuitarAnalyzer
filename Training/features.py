@@ -96,3 +96,17 @@ def harmonic_features(audio, midi):
     levels = early - early.amax(dim=1, keepdim=True)
     decay = (early - late) / (LATE_S[0] - EARLY_S[0])
     return torch.cat([b[:, None], levels, decay], dim=1)
+
+
+def harmonic_stats(clips, midi, batch=64):
+    """Mean and standard deviation of the harmonic features over a training set's clips."""
+    feats = torch.cat([harmonic_features(c, m) for c, m in zip(clips.split(batch), midi.split(batch))])
+    return feats.mean(dim=0), feats.std(dim=0).clamp(min=1e-3)
+
+
+def standardized_harmonics(audio, midi, stats):
+    """Harmonic features scaled by the training statistics; an empty input when stats is None."""
+    if stats is None:
+        return torch.zeros(len(audio), 0)
+    mean, std = stats
+    return (harmonic_features(audio, midi) - mean) / std
