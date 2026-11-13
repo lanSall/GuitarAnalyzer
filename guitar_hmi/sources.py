@@ -96,21 +96,31 @@ class GuitarSynth:
         self._prepared = None
         self.truth = []
 
-    def prepare(self):
-        """Choose and synthesize the next event ahead of time (synthesis is the slow part)."""
+    def prepare(self, frets=None, mistakes=None):
+        """Synthesize the next event ahead of time (synthesis is the slow part).
+
+        With no arguments a random note or chord is chosen; otherwise `frets` is
+        {string_index: fret} and `mistakes` is {string_index: "muted" | "buzz"}.
+        """
         rng, sr = self.rng, self.sr
-        if rng.random() < 0.45:
-            s = int(rng.integers(6))
-            frets = {s: int(rng.integers(0, 13))}
-            order = [s]
-            chord = None
+        chord = None
+        if frets is None:
+            if rng.random() < 0.45:
+                s = int(rng.integers(6))
+                frets = {s: int(rng.integers(0, 13))}
+            else:
+                chord = str(rng.choice(list(VOICINGS)))
+                frets = {i: f for i, f in enumerate(VOICINGS[chord]) if f is not None}
+            mistakes = {}
+            if rng.random() < self.mistake_rate:
+                mistakes[int(rng.choice(list(frets)))] = str(rng.choice(["muted", "buzz"]))
         else:
-            chord = str(rng.choice(list(VOICINGS)))
-            frets = {i: f for i, f in enumerate(VOICINGS[chord]) if f is not None}
-            order = sorted(frets, reverse=rng.random() < 0.3)
-        mistakes = {}
-        if rng.random() < self.mistake_rate:
-            mistakes[int(rng.choice(list(frets)))] = str(rng.choice(["muted", "buzz"]))
+            chord = next((n for n, v in VOICINGS.items()
+                          if {i: f for i, f in enumerate(v) if f is not None} == frets), None)
+            if chord is None and len(frets) > 1:
+                chord = "chord"
+        mistakes = mistakes or {}
+        order = sorted(frets, reverse=rng.random() < 0.3)
 
         step = rng.uniform(0.008, 0.018) * sr
         velocity = rng.uniform(0.5, 1.0)
@@ -233,6 +243,30 @@ class SimulatedSource(_PacedSource):
         return block
 
 
+class PromptedSimSource(_PacedSource):
+    """Simulated player that plays whatever it is asked to, shortly after being asked."""
+
+    label = "Simulated player (follows prompts)"
+
+    def __init__(self, sr=48000, seed=None):
+        super().__init__(sr)
+        self.synth = GuitarSynth(sr, seed)
+        self._lock = threading.Lock()
+        self._play_at = None
+
+    def request(self, frets, mistakes=None):
+        with self._lock:
+            self.synth.prepare(dict(frets), dict(mistakes or {}))
+            self._play_at = self.ring.total + int(self.synth.rng.uniform(0.5, 1.0) * self.sr)
+
+    def _next_block(self, written):
+        with self._lock:
+            if self._play_at is not None and written >= self._play_at:
+                self._play_at = None
+                self.synth.trigger(written)
+            return self.synth.render(self.block)
+
+
 class FileSource(_PacedSource):
     def __init__(self, path, channel=0, loop=True):
         import soundfile as sf
@@ -251,6 +285,69 @@ class FileSource(_PacedSource):
         return block
 
 
+_API_RANK = {
+    "Windows WDM-KS": 0,
+    "ASIO": 1,
+    "Windows WASAPI": 2,
+    "Windows DirectSound": 3,
+    "MME": 4,
+}
+
+
+def _device_key(name):
+    text = " ".join(str(name).lower().split())
+    inner = text[text.find("(") + 1:text.rfind(")")] if "(" in text and ")" in text else text
+    return inner.strip() or text
+
+
+def _is_mapper(name):
+    n = name.lower()
+    return "mapper" in n or n.startswith("primary sound")
+
+
+def _looks_like_interface(name):
+    n = name.upper()
+    return any(tag in n for tag in ("UM2", "U-PHORIA", "USB AUDIO CODEC", "BEHRINGER"))
+
+
+def _hostapi(sd, index):
+    info = sd.query_devices(index)
+    return sd.query_hostapis(info["hostapi"])["name"]
+
+
+def _candidate_devices(sd, device):
+    """Requested device first, then the same endpoint on a host API Windows can actually open."""
+    inputs = [d for d in sd.query_devices() if d["max_input_channels"] > 0]
+    ranked = sorted(
+        inputs,
+        key=lambda d: (
+            0 if _looks_like_interface(d["name"]) else 1,
+            _API_RANK.get(_hostapi(sd, d["index"]), 9),
+            0 if "microphone" in d["name"].lower() else 1,
+            1 if _is_mapper(d["name"]) else 0,
+            d["index"],
+        ),
+    )
+    if device is None:
+        return [d["index"] for d in ranked]
+
+    try:
+        requested = sd.query_devices(device)
+    except Exception:
+        return [d["index"] for d in ranked]
+
+    key = _device_key(requested["name"])
+    siblings = [d for d in ranked if _device_key(d["name"]) == key]
+    order = [requested["index"]]
+    for d in siblings:
+        if d["index"] not in order:
+            order.append(d["index"])
+    for d in ranked:
+        if d["index"] not in order:
+            order.append(d["index"])
+    return order
+
+
 class LiveSource(AudioSource):
     def __init__(self, sr=48000, device=None, channel=0, blocksize=128):
         super().__init__(sr)
@@ -262,24 +359,56 @@ class LiveSource(AudioSource):
     def start(self):
         import sounddevice as sd
 
-        def callback(indata, frames, time_info, status):
-            self.ring.write(indata[:, self.channel])
+        needed = self.channel + 1
 
-        self._stream = sd.InputStream(
-            samplerate=self.sr,
-            device=self.device,
-            channels=self.channel + 1,
-            dtype="float32",
-            blocksize=self.blocksize,
-            latency="low",
-            callback=callback,
+        def callback(indata, frames, time_info, status):
+            col = min(self.channel, indata.shape[1] - 1)
+            self.ring.write(indata[:, col])
+
+        last_error = None
+        for index in _candidate_devices(sd, self.device):
+            info = sd.query_devices(index)
+            if info["max_input_channels"] < needed:
+                continue
+            for kwargs in (
+                dict(blocksize=self.blocksize, latency="low"),
+                dict(blocksize=self.blocksize),
+                dict(),
+            ):
+                try:
+                    stream = sd.InputStream(
+                        samplerate=self.sr,
+                        device=index,
+                        channels=needed,
+                        dtype="float32",
+                        callback=callback,
+                        **kwargs,
+                    )
+                    stream.start()
+                    if not stream.active:
+                        stream.close()
+                        last_error = RuntimeError(
+                            f"{info['name']} ({_hostapi(sd, index)}) opened but stayed inactive"
+                        )
+                        break
+                    self._stream = stream
+                    api = _hostapi(sd, stream.device)
+                    self.label = (
+                        f"Live: {info['name']} ({api}), ch {self.channel}, "
+                        f"{stream.latency * 1000:.1f} ms"
+                    )
+                    return
+                except Exception as exc:
+                    last_error = exc
+        hint = (
+            "Windows MME/WASAPI often cannot open a USB class-compliant interface. "
+            "Unplug/replug the UM2, close other apps using it, and pick the "
+            "WDM-KS 'USB Audio CODEC' entry if it is listed."
         )
-        self._stream.start()
-        info = sd.query_devices(self._stream.device)
-        api = sd.query_hostapis(info["hostapi"])["name"]
-        self.label = f"Live: {info['name']} ({api}), ch {self.channel}, {self._stream.latency * 1000:.1f} ms"
+        raise RuntimeError(f"Could not open live input: {last_error}\n{hint}") from last_error
 
     def stop(self):
         if self._stream:
             self._stream.stop()
             self._stream.close()
+            self._stream = None
