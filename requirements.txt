@@ -3,3 +3,8 @@ sounddevice
 soundfile
 PySide6
 pyqtgraph
+torch
+torchvision
+pyarrow
+requests
+soxr

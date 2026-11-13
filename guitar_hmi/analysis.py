@@ -31,24 +31,28 @@ from .guitar import (
 
 # Thresholds are tuned on the simulator; expect to re-tune them on the real piezo.
 ONSET_RISE_DB = 9.0
-ONSET_FLOOR_DB = -62.0
+ONSET_FLOOR_DB = -68.0
 REFRACTORY_S = 0.07
 ANALYSIS_WINDOW_S = 0.1
 PRE_ONSET_S = 0.005
-RESTRIKE_RISE_DB = 3.0
-REL_SALIENCE = 0.2
+# A note must get louder at the pluck. The live 82 Hz drone otherwise looks like
+# a permanent open low E, and its harmonics hide B and high E.
+RESTRIKE_RISE_DB = 6.0
+REL_SALIENCE = 0.35
 MAX_NOTES = 6
 MUTE_CHECK_AGE_S = 0.32
-MUTE_DROP_DB = 15.0
-RELEASE_DROP_DB = 45.0
+# dB drop from peak that counts as a dead string. High E on a soundhole piezo
+# decays this much while still ringing; only a real mute falls farther.
+MUTE_DROP_DB = [18.0, 20.0, 22.0, 26.0, 32.0, 40.0]
+RELEASE_DROP_DB = 24.0
 SILENCE_DB = -72.0
-BUZZ_WINDOW_S = (0.13, 0.25)
+BUZZ_WINDOW_S = (0.22, 0.38)
 TRACK_HARMONICS = 6
 # Long enough to separate low notes a few semitones apart (E2-F2 is ~5 Hz).
 TRACK_WINDOW_S = 0.17
 BUZZ_BAND_HZ = (2500.0, 8000.0)
-BUZZ_BAND_DB = -50.0
-BUZZ_FLATNESS = 0.006
+BUZZ_BAND_DB = -38.0
+BUZZ_FLATNESS = 0.02
 HARMONIC_REL_SALIENCE = 0.5
 CHORD_SHAPE_BONUS = 0.02
 ABSENT_RATIO = 0.08
@@ -150,6 +154,139 @@ def _level_db(peaks, midi, harmonics=range(TRACK_HARMONICS)):
     return 20.0 * np.log10(peaks[midi - LOWEST_MIDI, list(harmonics)].sum() + 1e-9)
 
 
+def _is_harmonic_of(higher, lower, cents=60.0):
+    if higher <= lower:
+        return False
+    ratio = midi_to_hz(higher) / midi_to_hz(lower)
+    nearest = round(ratio)
+    if nearest < 2 or nearest > 6:
+        return False
+    return abs(1200.0 * np.log2(ratio / nearest)) < cents
+
+
+def _without_harmonic_duplicates(found):
+    """If two notes are harmonic (octave, 12th, …), keep the louder one.
+
+    Always keeping the lower note hid open B and high E whenever the 82 Hz
+    low-E drone was present. Chord shapes can still restore real doublings.
+    """
+    notes = [(int(m), float(s)) for m, s in found]
+    drop = set()
+    for i, (a, sa) in enumerate(notes):
+        for b, sb in notes:
+            if a == b:
+                continue
+            if _is_harmonic_of(a, b):
+                drop.add(a if sa <= sb * 1.15 else b)
+            elif _is_harmonic_of(b, a):
+                drop.add(b if sb <= sa * 1.15 else a)
+    kept = []
+    for midi, _ in notes:
+        if midi not in drop and midi not in kept:
+            kept.append(midi)
+    return kept
+
+
+def _fold_down_octaves(bank, mag, found):
+    """If 2f was picked as the note, step down when f0 or 3f of the lower octave exist.
+
+    Open high E (330 Hz) on a piezo is often reported as fret 12 (660 Hz).
+    The 3rd partial of E4 (~990 Hz) is not a harmonic of E5, so it is evidence
+    the lower octave is the real string.
+    """
+    if not found:
+        return found
+    peaks = bank.peaks(mag)
+    out = []
+    for midi in found:
+        cur = int(midi)
+        while cur - 12 >= LOWEST_MIDI:
+            lo = cur - 12
+            hi_f0 = float(peaks[cur - LOWEST_MIDI, 0]) + 1e-12
+            lo_f0 = float(peaks[lo - LOWEST_MIDI, 0])
+            lo_h3 = float(peaks[lo - LOWEST_MIDI, 2])
+            if lo_f0 >= 0.08 * hi_f0 or lo_h3 >= 0.10 * hi_f0:
+                cur = lo
+            else:
+                break
+        if cur not in out:
+            out.append(cur)
+    return out
+
+
+def _multi_pitch(bank, mag):
+    """Iteratively pick the strongest harmonic series and remove it, most salient first."""
+    res = mag.copy()
+    found = []
+    first = None
+    for _ in range(MAX_NOTES):
+        sal = bank.salience(res)
+        for m, _s in found:
+            sal[max(m - LOWEST_MIDI - 1, 0):m - LOWEST_MIDI + 2] = 0.0
+        picked = [m for m, _s in found]
+        harmonic_of_found = np.array([
+            any(_is_harmonic_of(c, m) for m in picked)
+            for c in bank.midis
+        ])
+        sal = np.where(harmonic_of_found & (sal < HARMONIC_REL_SALIENCE * (first or 0)), 0.0, sal)
+        row = int(np.argmax(sal))
+        first = sal[row] if first is None else first
+        if sal[row] <= 0 or sal[row] < REL_SALIENCE * first:
+            break
+        found.append((LOWEST_MIDI + row, float(sal[row])))
+        bank.attenuate(res, row, 0.15)
+    return _fold_down_octaves(bank, mag, _without_harmonic_duplicates(found))
+
+
+_pitch_banks = {}
+
+
+def detect_pitches(segment, sr):
+    """Pitches (MIDI, most salient first) in a short segment that starts just before an onset."""
+    key = (sr, len(segment))
+    bank = _pitch_banks.get(key)
+    if bank is None:
+        bank = _pitch_banks[key] = _HarmonicBank(sr, _pow2(len(segment)) * 4, len(segment))
+    return _multi_pitch(bank, _spectrum(np.asarray(segment, np.float32), bank.nfft))
+
+
+class OnsetDetector:
+    """Flags sudden rises in high-frequency energy (pluck attacks) in a RingBuffer stream."""
+
+    def __init__(self, sr, rise_db=ONSET_RISE_DB, floor_db=ONSET_FLOOR_DB, refractory_s=REFRACTORY_S):
+        self.sr = sr
+        self.rise_db = rise_db
+        self.floor_db = floor_db
+        self.refractory = int(refractory_s * sr)
+        self.frame_len = max(int(0.004 * sr), 16)
+        self._pos = None
+        self._recent = deque(maxlen=12)
+        self._last_onset = -10 ** 12
+
+    def scan(self, ring):
+        """Onset sample indices found in audio that arrived since the last call."""
+        total = ring.total
+        if self._pos is None:
+            self._pos = total
+        self._pos = max(self._pos, total - self.sr)
+        n_frames = (total - self._pos) // self.frame_len
+        if n_frames <= 0:
+            return []
+        x = ring.get_range(self._pos - 1, self._pos + n_frames * self.frame_len)
+        d = np.diff(x).reshape(n_frames, self.frame_len)
+        energy_db = 10.0 * np.log10(np.mean(d * d, axis=1) + 1e-12)
+        onsets = []
+        for k, e in enumerate(energy_db):
+            start = self._pos + k * self.frame_len
+            base = np.median(self._recent) if self._recent else e
+            if e > self.floor_db and e - base > self.rise_db and start - self._last_onset > self.refractory:
+                self._last_onset = start
+                onsets.append(start)
+            self._recent.append(e)
+        self._pos += n_frames * self.frame_len
+        return onsets
+
+
 def _assign_harmonics(strings):
     """Track each ringing string on the harmonics no other ringing string shares."""
     active = [s for s in strings if s.active]
@@ -174,11 +311,9 @@ class DspAnalyzer:
         self.seg_len = int(ANALYSIS_WINDOW_S * sr)
         self.pre_len = int(PRE_ONSET_S * sr)
         self.seg_bank = _HarmonicBank(sr, _pow2(self.seg_len) * 4, self.seg_len)
-        self.frame_len = max(int(0.004 * sr), 16)
         self.display_mask = (self.track_bank.freqs >= 40.0) & (self.track_bank.freqs <= 5000.0)
-        self._pos = None
-        self._recent = deque(maxlen=12)
-        self._last_onset = -10 ** 12
+        # Strums arriving before the first strike's analysis window closes are merged into it.
+        self.onsets = OnsetDetector(sr, refractory_s=max(REFRACTORY_S, ANALYSIS_WINDOW_S - PRE_ONSET_S))
         self._pending = []
         self._strikes = 0
 
@@ -187,7 +322,8 @@ class DspAnalyzer:
         total = ring.total
         now = total / self.sr
         events = []
-        self._scan_onsets(ring, total)
+        for onset in self.onsets.scan(ring):
+            self._pending.append((onset - self.pre_len + self.seg_len, "analyze", onset))
 
         due = sorted(p for p in self._pending if p[0] <= total)
         self._pending = [p for p in self._pending if p[0] > total]
@@ -204,31 +340,6 @@ class DspAnalyzer:
         spec_db = 20.0 * np.log10(mag[self.display_mask] + 1e-9)
         return Frame(now, self.strings, events, self.chord, self.track_bank.freqs[self.display_mask], spec_db, input_db)
 
-    def _scan_onsets(self, ring, total):
-        if self._pos is None:
-            self._pos = total
-        self._pos = max(self._pos, total - self.sr)
-        n_frames = (total - self._pos) // self.frame_len
-        if n_frames <= 0:
-            return
-        x = ring.get_range(self._pos - 1, self._pos + n_frames * self.frame_len)
-        d = np.diff(x).reshape(n_frames, self.frame_len)
-        energy_db = 10.0 * np.log10(np.mean(d * d, axis=1) + 1e-12)
-        for k, e in enumerate(energy_db):
-            start = self._pos + k * self.frame_len
-            base = np.median(self._recent) if self._recent else e
-            busy = any(kind == "analyze" for _, kind, _ in self._pending)
-            if (
-                e > ONSET_FLOOR_DB
-                and e - base > ONSET_RISE_DB
-                and start - self._last_onset > REFRACTORY_S * self.sr
-                and not busy
-            ):
-                self._last_onset = start
-                self._pending.append((start - self.pre_len + self.seg_len, "analyze", start))
-            self._recent.append(e)
-        self._pos += n_frames * self.frame_len
-
     # ------------------------------------------------------------- per strike
     def _analyze_onset(self, ring, onset):
         seg = ring.get_range(onset - self.pre_len, onset - self.pre_len + self.seg_len)
@@ -238,10 +349,10 @@ class DspAnalyzer:
         post = self.seg_bank.peaks(mag)
         pre = self.track_bank.peaks(_spectrum(ring.get_range(onset - self.track_len, onset), self.track_bank.nfft))
 
-        detected = self._multi_pitch(mag)
-        for s in self.strings:
-            if s.active and s.midi in detected and _level_db(post, s.midi) - _level_db(pre, s.midi) < RESTRIKE_RISE_DB:
-                detected.remove(s.midi)
+        detected = [
+            m for m in _multi_pitch(self.seg_bank, mag)
+            if _level_db(post, m) - _level_db(pre, m) >= RESTRIKE_RISE_DB
+        ]
         if not detected:
             return None
 
@@ -263,53 +374,35 @@ class DspAnalyzer:
             s.mute_checked = s.shadowed
 
         midis = [OPEN_MIDI[i] + f for i, f in frets.items()]
+        heard = " ".join(note_name(m) for m in detected)
         if len(frets) > 1:
             self.chord = name_chord(midis)
-            label = f"{self.chord}  {tab_string(frets)}"
+            label = f"{self.chord}  {tab_string(frets)}   heard {heard}"
             kind = "chord"
         else:
             i, f = next(iter(frets.items()))
             self.chord = note_name(midis[0])
-            label = f"string {string_number(i)} fret {f}  ({self.chord})"
+            label = f"string {string_number(i)} fret {f}  ({self.chord})   heard {heard}"
             kind = "note"
         self._pending.append((onset + int(BUZZ_WINDOW_S[1] * self.sr), "buzz", onset))
         return Event(onset_s, 0.0, kind, label, frets, strike_ids)
 
-    def _multi_pitch(self, mag):
-        bank = self.seg_bank
-        res = mag.copy()
-        found = []
-        first = None
-        for _ in range(MAX_NOTES):
-            sal = bank.salience(res)
-            for m in found:
-                sal[max(m - LOWEST_MIDI - 1, 0):m - LOWEST_MIDI + 2] = 0.0
-            # A pitch sitting on a harmonic of a found note (octave, 12th, ...) needs
-            # much more evidence; chord shapes restore genuine octave doublings later.
-            harmonic_of_found = np.array([
-                any(abs(12 * np.log2(h) - (c - m)) < 0.5 for m in found for h in range(2, 7))
-                for c in bank.midis
-            ])
-            sal = np.where(harmonic_of_found & (sal < HARMONIC_REL_SALIENCE * (first or 0)), 0.0, sal)
-            row = int(np.argmax(sal))
-            first = sal[row] if first is None else first
-            if sal[row] <= 0 or sal[row] < REL_SALIENCE * first:
-                break
-            found.append(LOWEST_MIDI + row)
-            bank.attenuate(res, row, 0.15)
-        return found
-
     def _assign(self, detected, mag):
-        """Map detected pitches to strings: a known chord shape if one explains the spectrum
-        at least as well as the detected notes do, else the most playable fingering."""
+        """Map detected pitches to strings. Single notes stay on the lowest-fret
+        fingering; library shapes are only tried for actual strums, and only if
+        they contain every pitch class we heard."""
         free = self._fingering(detected)
-        if len({m % 12 for m in detected}) < 2:
+        detected_pc = {m % 12 for m in detected}
+        if len(detected_pc) < 2:
             return free
         peaks = self._spectral_peaks(mag)
-        best, best_score = free, self._explain(peaks, [OPEN_MIDI[i] + f for i, f in free.items()]) - CHORD_SHAPE_BONUS
+        best, best_score = free, self._explain(peaks, [OPEN_MIDI[i] + f for i, f in free.items()])
         for frets in VOICINGS.values():
             shape = {i: f for i, f in enumerate(frets) if f is not None}
-            score = self._explain(peaks, [OPEN_MIDI[i] + f for i, f in shape.items()])
+            notes = [OPEN_MIDI[i] + f for i, f in shape.items()]
+            if not detected_pc.issubset({n % 12 for n in notes}):
+                continue
+            score = self._explain(peaks, notes) + CHORD_SHAPE_BONUS
             if score > best_score:
                 best, best_score = shape, score
         return best
@@ -410,7 +503,8 @@ class DspAnalyzer:
             silent = s.level_db < SILENCE_DB or s.level_db < s.peak_db - RELEASE_DROP_DB
             if not s.mute_checked and (age >= MUTE_CHECK_AGE_S or silent):
                 s.mute_checked = True
-                if silent or s.peak_db - s.level_db > MUTE_DROP_DB:
+                # Going quiet is not enough: treble notes on this pickup fade fast.
+                if s.peak_db - s.level_db > MUTE_DROP_DB[s.index]:
                     s.quality = "muted"
                     events.append(Event(s.onset, now, "mistake",
                                         f"MUTED string {string_number(s.index)} (fret {s.fret})",
