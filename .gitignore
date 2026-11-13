@@ -1,3 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
+dataset/
+dataset_sim/
+dataset_hf/
