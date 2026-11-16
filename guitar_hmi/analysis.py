@@ -28,6 +28,7 @@ from .guitar import (
     string_number,
     tab_string,
 )
+from .tab import TabSession
 
 # Thresholds are tuned on the simulator; expect to re-tune them on the real piezo.
 ONSET_RISE_DB = 9.0
@@ -87,6 +88,7 @@ class Event:
     frets: dict = field(default_factory=dict)
     strike_ids: dict = field(default_factory=dict)
     quality: str = ""
+    dropped: list = field(default_factory=list)  # strike ids this event shows were never played
 
 
 @dataclass
@@ -299,11 +301,19 @@ def _assign_harmonics(strings):
         s.harmonics = unique or list(range(TRACK_HARMONICS))
 
 
+MODES = {
+    "auto": "Auto (note or chord by how many pitches are heard)",
+    "chords": "Chords (every pluck is a strum)",
+    "picking": "Picking (every pluck is one note)",
+}
+
+
 class DspAnalyzer:
     name = "DSP baseline"
 
     def __init__(self, sr):
         self.sr = sr
+        self.mode = "auto"  # a MODES key; may be changed while running
         self.strings = [StringState(i) for i in range(6)]
         self.chord = ""
         self.track_len = _pow2(TRACK_WINDOW_S * sr)
@@ -316,6 +326,7 @@ class DspAnalyzer:
         self.onsets = OnsetDetector(sr, refractory_s=max(REFRACTORY_S, ANALYSIS_WINDOW_S - PRE_ONSET_S))
         self._pending = []
         self._strikes = 0
+        self.tab = TabSession()
 
     # ------------------------------------------------------------------ stream
     def process(self, ring):
@@ -355,6 +366,8 @@ class DspAnalyzer:
         ]
         if not detected:
             return None
+        if self.mode == "picking":
+            detected = detected[:1]
 
         frets = self._assign(detected, mag)
         onset_s = onset / self.sr
@@ -375,7 +388,7 @@ class DspAnalyzer:
 
         midis = [OPEN_MIDI[i] + f for i, f in frets.items()]
         heard = " ".join(note_name(m) for m in detected)
-        if len(frets) > 1:
+        if len(frets) > 1 or self.mode == "chords":
             self.chord = name_chord(midis)
             label = f"{self.chord}  {tab_string(frets)}   heard {heard}"
             kind = "chord"
@@ -385,6 +398,7 @@ class DspAnalyzer:
             label = f"string {string_number(i)} fret {f}  ({self.chord})   heard {heard}"
             kind = "note"
         self._pending.append((onset + int(BUZZ_WINDOW_S[1] * self.sr), "buzz", onset))
+        self.tab.add(onset_s, frets, strike_ids)
         return Event(onset_s, 0.0, kind, label, frets, strike_ids)
 
     def _assign(self, detected, mag):
@@ -511,5 +525,6 @@ class DspAnalyzer:
                                         {s.index: s.fret}, {s.index: s.strike_id}, "muted"))
             if silent:
                 s.active, s.quality = False, "idle"
+                self.tab.release(s.strike_id, now)
                 _assign_harmonics(self.strings)
         return events

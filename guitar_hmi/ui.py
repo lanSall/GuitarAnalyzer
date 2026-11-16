@@ -1,23 +1,32 @@
-"""Real-time HMI: fretboard, per-string timeline, spectrum and event log."""
+"""Real-time HMI: fretboard, per-string timeline, scrolling tab, spectrum and event log."""
 import math
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
+    QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QProgressBar,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+from .analysis import MODES
 from .guitar import NUM_FRETS, OPEN_NAMES, midi_to_hz, note_name, string_number
+
+TAB_DIR = Path(__file__).resolve().parents[1] / "tabs"
+TAB_COLOR, TAB_REVISED_COLOR = "#e2e8f0", "#38bdf8"
 
 QUALITY_COLORS = {"ringing": "#4ade80", "muted": "#f87171", "buzz": "#fb923c", "idle": "#64748b"}
 QUALITY_TEXT = {"ringing": "ringing", "muted": "MUTED", "buzz": "BUZZ", "idle": "idle"}
@@ -25,6 +34,7 @@ STRING_COLORS = ["#ef4444", "#f59e0b", "#eab308", "#22c55e", "#3b82f6", "#a855f7
 GAUGES = [3.4, 2.8, 2.3, 1.8, 1.4, 1.1]
 TIMELINE_S = 8.0
 TICK_MS = 16
+AXIS_W = 56
 
 STYLE = """
 QWidget { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI'; }
@@ -165,6 +175,7 @@ class MainWindow(QMainWindow):
         self.fretboard = FretboardWidget()
         layout.addWidget(self.fretboard, 4)
         layout.addWidget(self._build_timeline(), 3)
+        layout.addWidget(self._build_tab(), 2)
         bottom = QHBoxLayout()
         bottom.addWidget(self._build_spectrum(), 1)
         self.log = QListWidget()
@@ -175,6 +186,7 @@ class MainWindow(QMainWindow):
         self.hist_t = deque(maxlen=int(TIMELINE_S * 1000 / TICK_MS) + 60)
         self.hist_lv = deque(maxlen=self.hist_t.maxlen)
         self.strike_items = {}
+        self.tab_items = {}
         self.mistake_until = 0.0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -208,8 +220,25 @@ class MainWindow(QMainWindow):
         self.meter.setTextVisible(False)
         self.meter.setFixedWidth(220)
         right.addWidget(self.meter, alignment=Qt.AlignRight)
+        export = QPushButton("Export tab")
+        export.setToolTip("Save everything played so far as ASCII tab (.txt) and MusicXML (.musicxml)")
+        export.setStyleSheet("QPushButton { background: #1f2937; border: 1px solid #334155; padding: 4px 12px; }")
+        export.clicked.connect(self._export_tab)
+        right.addWidget(export, alignment=Qt.AlignRight)
+        self.mode_box = QComboBox()
+        self.mode_box.setToolTip("Chords or Picking skips the note-or-chord guess when you know what you are playing")
+        self.mode_box.setStyleSheet("QComboBox { background: #1f2937; border: 1px solid #334155; padding: 3px 8px; }")
+        for key, text in MODES.items():
+            self.mode_box.addItem(text, key)
+        self.mode_box.setCurrentIndex(list(MODES).index(self.analyzer.mode))
+        self.mode_box.currentIndexChanged.connect(self._set_mode)
+        right.addWidget(self.mode_box, alignment=Qt.AlignRight)
         header.addLayout(right)
         return header
+
+    def _set_mode(self, _index):
+        self.analyzer.mode = self.mode_box.currentData()
+        self._log(f"Mode: {self.mode_box.currentText()}", "#94a3b8")
 
     def _build_timeline(self):
         tl = self.timeline = pg.PlotWidget()
@@ -217,6 +246,7 @@ class MainWindow(QMainWindow):
         tl.hideButtons()
         tl.setYRange(-0.05, 6.05, padding=0)
         tl.getAxis("left").setTicks([[(i + 0.4, f"{string_number(i)} {OPEN_NAMES[i]}") for i in range(6)]])
+        tl.getAxis("left").setWidth(AXIS_W)
         tl.setLabel("bottom", "time (s)")
         tl.setTitle("String activity (numbers = fret detected at each strike)", color="#94a3b8", size="10pt")
         for i in range(7):
@@ -227,6 +257,21 @@ class MainWindow(QMainWindow):
             fill.setAlpha(70)
             self.curves.append(tl.plot(pen=pg.mkPen(STRING_COLORS[i], width=1.5), fillLevel=i, brush=fill))
         return tl
+
+    def _build_tab(self):
+        tab = self.tab_plot = pg.PlotWidget()
+        tab.setMouseEnabled(False, False)
+        tab.hideButtons()
+        tab.setXLink(self.timeline)
+        tab.setYRange(-0.6, 5.6, padding=0)
+        tab.getAxis("left").setTicks([[(i, OPEN_NAMES[i]) for i in range(6)]])
+        tab.getAxis("left").setWidth(AXIS_W)
+        tab.getAxis("bottom").setStyle(showValues=False)
+        tab.setTitle("Tab (high e on top; blue = moved by the model or fingering after it first appeared)",
+                     color="#94a3b8", size="10pt")
+        for i in range(6):
+            tab.addItem(pg.InfiniteLine(pos=i, angle=0, pen=pg.mkPen("#475569")))
+        return tab
 
     def _build_spectrum(self):
         sp = pg.PlotWidget()
@@ -291,6 +336,48 @@ class MainWindow(QMainWindow):
             self.mistake_until = 0.0
         for sid in [k for k, (_, t0) in self.strike_items.items() if t0 < now - TIMELINE_S - 1]:
             self.timeline.removeItem(self.strike_items.pop(sid)[0])
+        self._update_tab(now)
+
+    def _update_tab(self, now):
+        oldest = now - TIMELINE_S - 1
+        for note in reversed(self.analyzer.tab.notes):
+            if note.time < oldest:
+                break
+            shown = self.tab_items.get(note.id)
+            if shown and shown[1] == note.version:
+                continue
+            if shown:
+                for item in shown[0]:
+                    self.tab_plot.removeItem(item)
+            color = TAB_REVISED_COLOR if note.version else TAB_COLOR
+            items = []
+            for i, fret in note.frets.items():
+                item = pg.TextItem(str(fret), color=color, anchor=(0.5, 0.5), fill="#111827")
+                item.setFont(QFont("Consolas", 11, QFont.Bold))
+                item.setPos(note.time, i)
+                self.tab_plot.addItem(item)
+                items.append(item)
+            self.tab_items[note.id] = (items, note.version, note.time)
+        for note_id in [k for k, (_, _, t0) in self.tab_items.items() if t0 < oldest]:
+            for item in self.tab_items.pop(note_id)[0]:
+                self.tab_plot.removeItem(item)
+
+    def _export_tab(self):
+        tab = self.analyzer.tab
+        if not tab.notes:
+            self._log("Nothing to export yet: no notes played", "#fbbf24")
+            return
+        TAB_DIR.mkdir(exist_ok=True)
+        default = TAB_DIR / f"tab_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        name, _ = QFileDialog.getSaveFileName(self, "Export tab", str(default), "ASCII tab (*.txt)")
+        if not name:
+            return
+        text_path = Path(name).with_suffix(".txt")
+        xml_path = text_path.with_suffix(".musicxml")
+        text_path.write_text(tab.ascii(), encoding="utf-8")
+        xml_path.write_text(tab.musicxml(), encoding="utf-8")
+        self._log(f"Exported {len(tab.notes)} notes to {text_path.name} and {xml_path.name} in {text_path.parent}",
+                  "#4ade80")
 
     def _handle_event(self, ev, now):
         latency_ms = (ev.detected_at - ev.time) * 1000
@@ -311,6 +398,10 @@ class MainWindow(QMainWindow):
 
         self.chord_label.setText(self.analyzer.chord)
         self.detail_label.setText(f"{ev.label}    ·    shown {latency_ms:.0f} ms after the pluck")
+        for sid in ev.dropped:
+            dropped = self.strike_items.pop(sid, None)
+            if dropped:
+                self.timeline.removeItem(dropped[0])
         for i, fret in ev.frets.items():
             replaced = self.strike_items.pop(ev.strike_ids[i], None)
             if replaced:

@@ -5,6 +5,8 @@
     python run_hmi.py --source live --device "UM2" --channel 1
     python run_hmi.py --source file --file recording.wav
     python run_hmi.py --model                 # let the trained model pick the string (models/string_model.pt)
+    python run_hmi.py --model --chords fit    # chord shapes from the template fit instead of the chord model
+    python run_hmi.py --model --mode picking  # every pluck is one note (or --mode chords: every pluck a strum)
 """
 import argparse
 import os
@@ -26,6 +28,12 @@ def main():
     ap.add_argument("--snapshot-after", type=float, default=8.0)
     ap.add_argument("--model", nargs="?", const="", metavar="PATH",
                     help="use the trained string model (default models/string_model.pt)")
+    ap.add_argument("--chords", choices=["auto", "model", "fit", "dsp"], default="auto",
+                    help="with --model: chord shapes from the chord model, the template fit, or the DSP "
+                         "(auto = model if models/chord_model.pt exists, else fit)")
+    ap.add_argument("--mode", choices=["auto", "chords", "picking"], default="auto",
+                    help="chords: every pluck is a strum; picking: every pluck is one note; "
+                         "auto: decide from how many pitches are heard (can also be switched in the window)")
     args = ap.parse_args()
 
     if args.asio:
@@ -64,14 +72,21 @@ def main():
         source = SimulatedSource(48000, args.seed)
 
     if args.model is not None:
-        from guitar_hmi.model_analyzer import DEFAULT_MODEL, ModelAnalyzer
+        from guitar_hmi.model_analyzer import DEFAULT_CHORD_MODEL, DEFAULT_MODEL, DEFAULT_TEMPLATES, ModelAnalyzer
 
         path = args.model or DEFAULT_MODEL
         if not os.path.exists(path):
             ap.error(f"no model at {path}; train one with: python Training\\Training.py --save")
-        analyzer = ModelAnalyzer(source.sr, path)
+        if args.chords == "model" and not DEFAULT_CHORD_MODEL.exists():
+            ap.error(f"no chord model at {DEFAULT_CHORD_MODEL}; train one with: python Training\\train_chords.py --save")
+        if args.chords == "fit" and not DEFAULT_TEMPLATES.exists():
+            ap.error(f"no templates at {DEFAULT_TEMPLATES}; build them with: python Training\\templates.py")
+        analyzer = ModelAnalyzer(source.sr, path,
+                                 templates_path=DEFAULT_TEMPLATES if args.chords in ("auto", "fit") else None,
+                                 chord_model_path=DEFAULT_CHORD_MODEL if args.chords in ("auto", "model") else None)
     else:
         analyzer = DspAnalyzer(source.sr)
+    analyzer.mode = args.mode
 
     app = QApplication(sys.argv)
     window = MainWindow(source, analyzer)
