@@ -9,17 +9,22 @@ from torch import nn
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_RATE = 48000
 ONSET_S = 0.1
-STORE_SAMPLES = int((ONSET_S + 1.2) * SAMPLE_RATE)
+POST_S = 0.25
+STORE_SAMPLES = int((ONSET_S + POST_S) * SAMPLE_RATE)
 OPEN_MIDI = {1: 64, 2: 59, 3: 55, 4: 50, 5: 45, 6: 40}
 TEST_GROUP = "hf_deb"
+MAX_FRET = 5
+# Hugging Face electric guitars, left out by default because the monitor listens to an acoustic.
+ELECTRIC_GROUPS = {"hf_ele", "hf_ele_natural"}
 
 
 def midi_of(string, fret):
     return OPEN_MIDI[string] + fret
 
 
-def load_rows(dataset_dir):
-    """Clean single-note clips that passed the recorder's quality check."""
+def load_rows(dataset_dir, max_fret=MAX_FRET, electric=False):
+    """Clean single-note clips at or below max_fret that passed the recorder's quality check,
+    without the ELECTRIC_GROUPS unless electric is true."""
     with open(dataset_dir / "labels.csv", newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     rows = [r for r in rows if r["kind"] == "note" and r["quality"] == "clean" and r["qc_pass"] == "1"]
@@ -27,7 +32,7 @@ def load_rows(dataset_dir):
         r["path"] = dataset_dir / r["file"]
         r["string"], r["fret"] = int(r["string"]), int(r["fret"])
         r["group"] = r["session"] if r["session"].startswith("hf_") else "piezo"
-    return rows
+    return [r for r in rows if r["fret"] <= max_fret and (electric or r["group"] not in ELECTRIC_GROUPS)]
 
 
 def split_by_groups(rows, held_out):
@@ -50,5 +55,6 @@ def load_audio(row, n_samples=STORE_SAMPLES):
 
 
 def load_clips(rows, n_samples=STORE_SAMPLES):
-    """(clips, samples) tensor holding every row's audio from just before the pluck, loaded once."""
+    """(clips, samples) tensor holding every row's audio from ONSET_S before the pluck to POST_S
+    after it, loaded once. Live use reads the same span from the ring buffer."""
     return torch.stack([load_audio(r, n_samples) for r in rows]) if rows else torch.zeros(0, n_samples)

@@ -94,11 +94,20 @@ class Launcher(QMainWindow):
         self.asio.setChecked(self.settings.value("asio", "false") == "true")
         self.asio.toggled.connect(self.refresh_devices)
         row.addWidget(self.asio)
-        self.use_model = QCheckBox("Trained string model")
-        self.use_model.setToolTip("Monitors let the model trained by Training\\Training.py --save pick the string "
-                                  f"for single notes, about 1.2 s after the pluck ({MODEL.relative_to(ROOT)}).")
+        self.use_model = QCheckBox("Trained models")
+        self.use_model.setToolTip("Monitors let the models trained by Training\\Training.py --save and "
+                                  "Training\\train_chords.py --save pick strings for notes and chord shapes, "
+                                  f"about 250 ms after the pluck ({MODEL.relative_to(ROOT)}).")
         self.use_model.setChecked(self.settings.value("use_model", "false") == "true")
         row.addWidget(self.use_model)
+        self.mode = QComboBox()
+        for key, text in (("auto", "Auto"), ("chords", "Chords"), ("picking", "Picking")):
+            self.mode.addItem(text, key)
+        self.mode.setToolTip("Monitor mode: Chords treats every pluck as a strum, Picking as one note, "
+                             "Auto decides from how many pitches it hears. Can be changed in the monitor too.")
+        self.mode.setCurrentIndex(max(self.mode.findData(self.settings.value("mode", "auto")), 0))
+        row.addWidget(QLabel("Mode"))
+        row.addWidget(self.mode)
         return box
 
     def _build_tools(self):
@@ -179,13 +188,15 @@ class Launcher(QMainWindow):
     # ------------------------------------------------------------------ tools
     def _model_args(self):
         self.settings.setValue("use_model", "true" if self.use_model.isChecked() else "false")
+        self.settings.setValue("mode", self.mode.currentData())
+        mode = ["--mode", self.mode.currentData()]
         if not self.use_model.isChecked():
-            return []
+            return mode
         if not MODEL.exists():
             self._write(f"No trained model at {MODEL}; run: python Training\\Training.py --save. "
                         "Using the DSP analyzer.")
-            return []
-        return ["--model", str(MODEL)]
+            return mode
+        return ["--model", str(MODEL)] + mode
 
     def live_monitor(self):
         self._run("Live monitor", "run_hmi.py", self._input_args() + self._model_args())

@@ -5,6 +5,10 @@
     python Training\\Training.py --val-sessions hf_ele  one custom holdout
     python Training\\Training.py --save                 train on every clip and save the model for the monitor
 
+Only clips at or below --max-fret (default 5, first position) are used, and the model hears the
+first 250 ms after the pluck, so the monitor can name the string that soon. The electric Hugging
+Face guitars are left out unless --include-electric is given.
+
 Labels use the CSV's numbering: string 1 = high E ... 6 = low E, fret 0 = open. Each Hugging
 Face source is one guitar group and all piezo sessions are another. hf_deb, the only
 recordings by a second player, is the reserved test guitar: it is never trained on, and only
@@ -19,8 +23,9 @@ import torch
 from torch import nn
 
 from augment import augment, spec_augment
-from data import ROOT, TEST_GROUP, load_clips, load_rows, midi_of, split_by_groups
-from features import N_HARMONIC_FEATURES, harmonic_stats, log_filterbank, spectrogram, standardized_harmonics
+from data import MAX_FRET, ROOT, TEST_GROUP, load_clips, load_rows, midi_of, split_by_groups
+from features import (FEATURE_S, N_HARMONIC_FEATURES, harmonic_stats, log_filterbank, spectrogram,
+                      standardized_harmonics)
 from model import Fretboard, NoteNet
 
 METRICS = ("exact", "pitch", "string", "string_given_pitch")
@@ -86,6 +91,7 @@ def save_model(path, model, board, stats, bank):
         "harmonic_mean": stats[0] if stats else None,
         "harmonic_std": stats[1] if stats else None,
         "n_bands": bank.shape[0],
+        "feature_s": FEATURE_S,
     }, path)
 
 
@@ -139,11 +145,13 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--no-augment", dest="augment", action="store_false")
     ap.add_argument("--no-harmonics", dest="harmonics", action="store_false")
+    ap.add_argument("--max-fret", type=int, default=MAX_FRET, help="ignore clips above this fret")
+    ap.add_argument("--include-electric", action="store_true", help="also train on the electric HF guitars")
     ap.add_argument("--save", type=Path, nargs="?", const=DEFAULT_MODEL,
                     help=f"train one model on every clip (seed = first of --seeds) and save it (default {DEFAULT_MODEL})")
     args = ap.parse_args()
 
-    rows = [r for d in args.dataset for r in load_rows(d)]
+    rows = [r for d in args.dataset for r in load_rows(d, args.max_fret, args.include_electric)]
     for i, r in enumerate(rows):
         r["idx"] = i
     clips = load_clips(rows)
@@ -166,7 +174,7 @@ def main():
         dev = [r for r in rows if r["group"] != TEST_GROUP]
         folds = {g: split_by_groups(dev, {g}) for g in sorted({r["group"] for r in dev})}
 
-    print(f"{len(rows)} clips; folds: {', '.join(folds)}; seeds {args.seeds}; {args.epochs} epochs; "
+    print(f"{len(rows)} clips (frets 0-{args.max_fret}); folds: {', '.join(folds)}; seeds {args.seeds}; {args.epochs} epochs; "
           f"augment {'on' if args.augment else 'off'}, harmonic features {'on' if args.harmonics else 'off'}")
 
     results = {fold: [] for fold in folds}

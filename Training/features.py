@@ -3,20 +3,19 @@ import math
 
 import torch
 
-from data import ONSET_S, SAMPLE_RATE
+from data import ONSET_S, POST_S, SAMPLE_RATE
 
-N_FFT = 8192
-HOP = 2048
-FEATURE_S = 1.0
+FEATURE_S = POST_S
+N_FFT = 4096
+HOP = 512
 F_MIN, F_MAX = 60.0, 12000.0
 BANDS_PER_OCTAVE = 36
 
 N_HARMONICS = 16
 HARMONIC_FFT = 65536
-EARLY_S = (0.0, 0.25)
-LATE_S = (0.5, 0.75)
+HARMONIC_WINDOW_S = (0.0, POST_S)
 MAX_B = 4e-4
-N_HARMONIC_FEATURES = 1 + 2 * N_HARMONICS
+N_HARMONIC_FEATURES = 1 + N_HARMONICS
 
 
 def log_filterbank():
@@ -34,9 +33,10 @@ def log_filterbank():
 
 def spectrogram(audio, bank):
     """Log-frequency spectrogram of the FEATURE_S after the pluck, (batch, 1, bands, frames).
+    The last frame ends FEATURE_S after the pluck, so live use can run that soon.
     Values are dB below the clip's loudest band, mapped from -80..0 dB to 0..1."""
     start = int(ONSET_S * SAMPLE_RATE)
-    segment = audio[:, start:start + int(FEATURE_S * SAMPLE_RATE) + N_FFT]
+    segment = audio[:, start:start + int(FEATURE_S * SAMPLE_RATE)]
     spec = torch.stft(segment, N_FFT, HOP, window=torch.hann_window(N_FFT), center=False,
                       return_complex=True).abs()
     db = 20 * torch.log10(bank @ spec + 1e-8)
@@ -75,12 +75,13 @@ def harmonic_features(audio, midi):
 
     - inharmonicity B from a least-squares fit of (f_h / h)^2 = f0^2 (1 + B h^2), using
       harmonics within 40 dB of the loudest; wound and plain strings differ most here
-    - each harmonic's early level in dB below the loudest harmonic
-    - each harmonic's decay in dB per second from the early to the late window
+    - each harmonic's level in dB below the loudest harmonic
+
+    Both come from the first POST_S after the pluck. Decay needs about a second of audio, too
+    late for live tab, so it is not used.
     """
     f0 = midi_hz(midi)
-    freq, early = _harmonic_peaks(audio, f0, EARLY_S)
-    _, late = _harmonic_peaks(audio, f0, LATE_S)
+    freq, early = _harmonic_peaks(audio, f0, HARMONIC_WINDOW_S)
 
     h = torch.arange(1, N_HARMONICS + 1, dtype=torch.float32)
     x, y = h * h, (freq / h) ** 2 / f0[:, None] ** 2
@@ -94,8 +95,7 @@ def harmonic_features(audio, midi):
     b = b.clamp(-MAX_B, MAX_B) * 1e4
 
     levels = early - early.amax(dim=1, keepdim=True)
-    decay = (early - late) / (LATE_S[0] - EARLY_S[0])
-    return torch.cat([b[:, None], levels, decay], dim=1)
+    return torch.cat([b[:, None], levels], dim=1)
 
 
 def harmonic_stats(clips, midi, batch=64):
