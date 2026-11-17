@@ -30,7 +30,7 @@ Double-click **`Guitar Analyzer.bat`**. On first run it creates a Python virtual
 
 The launcher lets you pick the audio input once, then start:
 
-- **Live monitor**: per-string display, spectrum, and live tablature from the guitar, with the last four bars as sheet music (notation over tab) beside the tab. Drag the divider between them to resize.
+- **Live monitor**: per-string display, spectrum, and live tablature from the guitar, with the same Verovio engraving as the PDF (notation over tab, dark colours) beside the tab. Drag the divider between them to resize.
 - **Simulator monitor**: the same display driven by a synthetic guitar (no hardware needed).
 - **File monitor**: replay a WAV/FLAC recording.
 - **Recorder**: prompted sessions that save labeled training clips.

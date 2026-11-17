@@ -34,8 +34,9 @@ def render_pdf(musicxml, pdf_path, title=None):
     return pdf.page_count
 
 
-def render_png(musicxml, zoom=1.0):
-    """PNG bytes of the whole score on one line, without title, cropped to the music."""
+def render_png(musicxml, zoom=1.0, dark=False):
+    """PNG bytes of the whole score on one line, without title, cropped to the music.
+    dark=True inverts it onto the monitor's background (#111827) with light ink."""
     import pymupdf
 
     toolkit = _load(musicxml, None, {
@@ -45,7 +46,26 @@ def render_png(musicxml, zoom=1.0):
         "header": "none", "footer": "none", "spacingStaff": LIVE_STAFF_SPACING,
     })
     page = pymupdf.open(stream=_for_mupdf(toolkit.renderToSVG(1)).encode("utf-8"), filetype="svg")[0]
-    return page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False).tobytes("png")
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+    if dark:
+        _darken(pix)
+    return pix.tobytes("png")
+
+
+def render_live_png(musicxml):
+    """Same engraving as the PDF, restyled for the monitor's dark panel. Called from a worker."""
+    return render_png(musicxml.replace("<part-name>Guitar</part-name>", "<part-name></part-name>"),
+                      zoom=1.6, dark=True)
+
+
+def _darken(pix):
+    """Black-on-white score -> light ink on #111827, matching the tab panel."""
+    import numpy as np
+
+    pix.invert_irect(pix.irect)
+    ink = np.ndarray((pix.h, pix.w, pix.n), dtype=np.uint8, buffer=pix.samples_mv)[:, :, :3]
+    paper = ink.max(axis=2) < 18
+    ink[paper] = (0x11, 0x18, 0x27)
 
 
 def _load(musicxml, title, options):
