@@ -1,7 +1,7 @@
 """Record the let-ring exercises (guitar_hmi/exercises.py) for scoring notes over ringing strings.
 
-    python record_exercise.py --device 19 --channel 1
-    python record_exercise.py --device 19 --channel 1 --only octaves --takes 2
+    python record_exercise.py --device "USB Audio CODEC" --channel 1
+    python record_exercise.py --device "USB Audio CODEC" --channel 1 --only octaves --takes 2
 
 Close the monitor first; the UM2 input usually can't be shared. Each take is saved as
 dataset/exercises/<session>/<exercise>_t<take>.wav with a .json holding the expected notes.

@@ -32,10 +32,12 @@ SHARED_OVERTONES = {0, 7, 12, 19, 24}
 CONTEXTS = ["nothing ringing", "over ringing", "over ringing, shared overtones"]
 
 
-def recorded_takes(folder):
+def recorded_takes(folder, take_numbers=None):
     takes = []
     for meta in sorted(Path(folder).rglob("*.json")):
         info = json.loads(meta.read_text(encoding="utf-8"))
+        if take_numbers and info["take"] not in take_numbers:
+            continue
         audio, sr = sf.read(meta.with_suffix(".wav"), dtype="float32", always_2d=True)
         takes.append((f"{meta.parent.name}/{meta.stem}", audio[:, 0], sr, [tuple(n) for n in info["notes"]], None))
     return takes
@@ -84,8 +86,8 @@ def synthetic_takes(n, seed, sessions=None, half=None, notes_per_take=8, max_fre
     return takes
 
 
-def replay(audio, sr, analyzer):
-    """(string number, fret) of every note the analyzer tabbed, in order."""
+def replay_notes(audio, sr, analyzer):
+    """(pluck time in seconds, (string number, fret)) of every note the analyzer tabbed, in order."""
     ring = RingBuffer(sr)
     block = int(BLOCK_S * sr)
     audio = np.concatenate([audio, np.zeros(int(TAIL_S * sr), np.float32)])
@@ -95,8 +97,13 @@ def replay(audio, sr, analyzer):
     found = []
     for note in analyzer.tab.notes:
         for index, fret in sorted(note.frets.items()):
-            found.append((6 - index, fret))
+            found.append((note.time, (6 - index, fret)))
     return found
+
+
+def replay(audio, sr, analyzer):
+    """(string number, fret) of every note the analyzer tabbed, in order."""
+    return [n for _, n in replay_notes(audio, sr, analyzer)]
 
 
 def align(expected, found):
@@ -153,6 +160,8 @@ def make_analyzer(kind, sr, model):
 def main():
     ap = argparse.ArgumentParser(description="Score notes plucked over ringing strings")
     ap.add_argument("--dir", default=str(ROOT / "dataset" / "exercises"), help="recorded exercises")
+    ap.add_argument("--takes", type=int, nargs="+",
+                    help="only these take numbers (the ones exercise_clips.py --takes left out of training)")
     ap.add_argument("--synthetic", type=int, default=0, help="score this many mixed sequences instead")
     ap.add_argument("--sessions", nargs="+", help="mix synthetic sequences only from these recording sessions")
     ap.add_argument("--half", type=int, choices=[0, 1],
@@ -164,7 +173,7 @@ def main():
     args = ap.parse_args()
 
     takes = (synthetic_takes(args.synthetic, args.seed, args.sessions, args.half) if args.synthetic
-             else recorded_takes(args.dir))
+             else recorded_takes(args.dir, args.takes))
     if not takes:
         sys.exit(f"No exercises in {args.dir}; record some with record_exercise.py or use --synthetic N")
 

@@ -135,8 +135,11 @@ def report(results, confusion, seeds):
 
 def main():
     ap = argparse.ArgumentParser(description="Train and evaluate a string/fret classifier on labeled guitar clips")
-    ap.add_argument("--dataset", type=Path, nargs="+", default=[ROOT / "dataset", ROOT / "dataset_hf"],
-                    help="one or more dataset folders, each with a labels.csv")
+    ap.add_argument("--dataset", type=Path, nargs="+",
+                    default=[d for d in (ROOT / "dataset", ROOT / "dataset_hf", ROOT / "dataset_ringing")
+                             if (d / "labels.csv").exists()],
+                    help="one or more dataset folders, each with a labels.csv (dataset_ringing comes from "
+                         "exercise_clips.py)")
     ap.add_argument("--val-sessions", nargs="+", help="hold out these groups or sessions instead of cross-validating")
     ap.add_argument("--test", action="store_true", help=f"train on every development guitar and score {TEST_GROUP}")
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
