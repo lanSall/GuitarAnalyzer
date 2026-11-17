@@ -213,6 +213,8 @@ Done: let-ring exercise recorder and scorer, spectral-flux pluck detection, ring
 3. More exercises beyond open position, so the string model is also tested where "lowest fret" is the wrong answer.
 4. Return to chords, then extend beyond first position.
 
-## Data credits
+## Credits
 
-The Hugging Face clips come from [collegefishiesd/guitar-fretboard-notes](https://huggingface.co/datasets/collegefishiesd/guitar-fretboard-notes) (CC BY-SA 4.0).
+**Data.** Extra single-note clips come from [Guitar Single-Note Recordings](https://huggingface.co/datasets/collegefishiesd/guitar-fretboard-notes) by [collegefishiesd](https://huggingface.co/collegefishiesd) (CC BY-SA 4.0): two players, acoustic and electric, sources `deb`, `eqm` / `eqm2`, and `ele` / `ele_natural`. Your own piezo recordings stay local (`dataset/`, `dataset_ringing/`) and are not in this repository.
+
+**Engraving.** Live sheet music and the printable PDF are engraved by [Verovio](https://www.verovio.org) (LGPL).
