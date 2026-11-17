@@ -13,7 +13,7 @@ The project is being deliberately narrowed. The current focus is **single notes 
 | Pluck detection (spectral flux) | Finds 99% of plucks in real let-ring exercises, including soft ones over ringing strings |
 | Pitch (DSP, ringing subtracted) | 88% right on real let-ring exercises; the misses are mostly octave and two-octave errors |
 | String/fret model (single notes) | Trained on single notes plus notes cut from let-ring exercises; on held-out exercise takes every note with the right pitch got the right string |
-| Live tablature (ASCII and MusicXML export) | Working |
+| Live tablature and sheet music (ASCII tab, MusicXML, PDF with notation over tab) | Working; rhythm is rounded to 8th notes and the key is guessed from the notes played |
 | Chord shapes (template fit and chord model) | Working on mixed test strums (~82% exact shapes on the own guitar); paused while single notes are improved |
 | Buzz / muted-string detection | Removed; it didn't add anything useful |
 
@@ -74,7 +74,7 @@ Close the monitor before recording; the UM2 input usually can't be shared betwee
 3. **String choice**: for single notes, the trained string model (`Training/model.py`, run through `Training/predictor.py`) reads a log-band spectrogram and harmonic features of the first 250 ms after the pluck and scores each string that can play the pitch.
 4. **Fingering context**: a short Viterbi tracker (`guitar_hmi/fingering.py`) prefers hand positions that are physically comfortable given the previous notes, and can revise earlier notes.
 5. **Chords**: either a non-negative fit of measured per-position spectra (`guitar_hmi/chord_fit.py`) or a per-string chord model trained on strums mixed from single notes (`Training/chords.py`), constrained to playable shapes.
-6. **Tablature**: `guitar_hmi/tab.py` builds the tab live and exports ASCII or MusicXML to `tabs/`.
+6. **Tablature and sheet music**: `guitar_hmi/tab.py` builds the tab live. **Export tab** in the monitor saves ASCII tab, MusicXML (standard notation over a tab staff, opens in MuseScore and other notation programs) and a printable PDF engraved by [Verovio](https://www.verovio.org) (`guitar_hmi/sheet.py`) to `tabs/`. Any MusicXML file can be turned into a PDF with `python -m guitar_hmi.sheet file.musicxml`.
 
 ## Training
 

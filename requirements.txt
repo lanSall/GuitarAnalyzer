@@ -8,3 +8,5 @@ torchvision
 pyarrow
 requests
 soxr
+verovio
+pymupdf

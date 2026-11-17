@@ -217,7 +217,8 @@ class MainWindow(QMainWindow):
         self.meter.setFixedWidth(220)
         right.addWidget(self.meter, alignment=Qt.AlignRight)
         export = QPushButton("Export tab")
-        export.setToolTip("Save everything played so far as ASCII tab (.txt) and MusicXML (.musicxml)")
+        export.setToolTip("Save everything played so far as ASCII tab (.txt), MusicXML (.musicxml) and "
+                          "sheet music with notation over tab (.pdf)")
         export.setStyleSheet("QPushButton { background: #1f2937; border: 1px solid #334155; padding: 4px 12px; }")
         export.clicked.connect(self._export_tab)
         right.addWidget(export, alignment=Qt.AlignRight)
@@ -368,9 +369,16 @@ class MainWindow(QMainWindow):
         text_path = Path(name).with_suffix(".txt")
         xml_path = text_path.with_suffix(".musicxml")
         text_path.write_text(tab.ascii(), encoding="utf-8")
-        xml_path.write_text(tab.musicxml(), encoding="utf-8")
-        self._log(f"Exported {len(tab.notes)} notes to {text_path.name} and {xml_path.name} in {text_path.parent}",
-                  "#4ade80")
+        xml = tab.musicxml()
+        xml_path.write_text(xml, encoding="utf-8")
+        written = [text_path.name, xml_path.name]
+        try:
+            from .sheet import render_pdf
+            render_pdf(xml, text_path.with_suffix(".pdf"), text_path.stem)
+            written.append(text_path.with_suffix(".pdf").name)
+        except Exception as exc:
+            self._log(f"Sheet music PDF skipped: {exc}", "#fbbf24")
+        self._log(f"Exported {len(tab.notes)} notes to {', '.join(written)} in {text_path.parent}", "#4ade80")
 
     def _handle_event(self, ev, now):
         latency_ms = (ev.detected_at - ev.time) * 1000
