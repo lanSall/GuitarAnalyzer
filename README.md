@@ -69,6 +69,69 @@ Close the monitor before recording; the UM2 input usually can't be shared betwee
 
 ## How it works
 
+Audio is analyzed twice: immediately at the pluck (DSP, so the display is not blank) and again 250 ms later (trained models can revise the string or the whole chord). Training is a separate loop that writes the `.pt` / `.npz` files the live path loads.
+
+```mermaid
+flowchart TD
+  subgraph audio [Audio in]
+    piezo[UM2 piezo]
+    sim[Simulator]
+    wav[WAV or FLAC file]
+  end
+
+  piezo --> src[LiveSource]
+  sim --> src2[SimulatedSource]
+  wav --> src3[FileSource]
+  src --> ring[Ring buffer]
+  src2 --> ring
+  src3 --> ring
+
+  ring --> flux[FluxOnsetDetector]
+  flux --> sub[Subtract pre-pluck spectrum]
+  sub --> pitch[DSP multi-pitch]
+  pitch --> dsp[DSP string and fret guess]
+  dsp --> tab[TabSession]
+  tab --> ui[Monitor UI]
+  tab --> exp[ASCII / MusicXML / PDF]
+
+  pitch --> wait[Wait 250 ms]
+  wait --> mode{Picking or chords?}
+  mode -->|note| net[StringPredictor / NoteNet]
+  net --> vit[FingeringTracker]
+  vit --> tab
+  mode -->|strum| chord[ChordNet or ChordFitter]
+  chord --> tab
+```
+
+```mermaid
+flowchart TD
+  rec[Clip recorder] --> ds["dataset/"]
+  ex[Exercise recorder] --> takes["dataset/exercises/"]
+  hf[Hugging Face import] --> dshf["dataset_hf/"]
+  takes --> cut[exercise_clips.py]
+  cut --> ringd["dataset_ringing/"]
+
+  ds --> train[Training.py]
+  ringd --> train
+  dshf --> train
+  train --> sm["models/string_model.pt"]
+
+  ds --> tmpl[templates.py]
+  tmpl --> npz["models/chord_templates.npz"]
+  ds --> mix[StrumMixer + train_chords.py]
+  mix --> cpt["models/chord_model.pt"]
+
+  sm --> live[ModelAnalyzer]
+  npz --> live
+  cpt --> live
+
+  takes --> evex[eval_exercises.py]
+  sm --> evex
+  ds --> evch[eval_chords.py]
+  npz --> evch
+  cpt --> evch
+```
+
 1. **Pluck detection**: spectral flux over 24 bands per octave (60 Hz–8 kHz) against an adaptive threshold marks each attack, so a new note stands out even while other strings ring; the attack is then pinned to the first sharp high-frequency rise (`guitar_hmi/analysis.py`, `FluxOnsetDetector`).
 2. **Pitch**: the spectrum from just before the pluck is subtracted from the one just after, so strings that were already ringing drop out; an iterative harmonic-salience search then finds the new pitches, and only pitches that got louder at the pluck count.
 3. **String choice**: for single notes, the trained string model (`Training/model.py`, run through `Training/predictor.py`) reads a log-band spectrogram and harmonic features of the first 250 ms after the pluck and scores each string that can play the pitch.
