@@ -1,4 +1,5 @@
-"""Engrave MusicXML (standard notation over tab) as a PDF with Verovio.
+"""Engrave MusicXML (standard notation over tab) with Verovio: a PDF for printing, or a PNG of a
+few bars on one line for the monitor's live sheet.
 
     python -m guitar_hmi.sheet tabs\\tab_20261116_221500.musicxml     writes the .pdf beside it
 """
@@ -10,20 +11,48 @@ from pathlib import Path
 PAGE_WIDTH, PAGE_HEIGHT = 2159, 2794
 MARGIN = 120
 SCALE = 45
+LIVE_SCALE = 40
+LIVE_MARGIN = 15
+LIVE_STAFF_SPACING = 6
 
 
 def render_pdf(musicxml, pdf_path, title=None):
     """Write the score as a PDF, one page per Verovio page; returns the number of pages."""
     import pymupdf
-    import verovio
 
-    toolkit = verovio.toolkit()
-    toolkit.setOptions({
+    toolkit = _load(musicxml, title, {
         "pageWidth": PAGE_WIDTH, "pageHeight": PAGE_HEIGHT, "scale": SCALE,
         "pageMarginLeft": MARGIN, "pageMarginRight": MARGIN,
         "pageMarginTop": MARGIN, "pageMarginBottom": MARGIN,
         "adjustPageHeight": False, "footer": "none", "breaks": "auto",
     })
+    pdf = pymupdf.open()
+    for page in range(1, toolkit.getPageCount() + 1):
+        svg = pymupdf.open(stream=_for_mupdf(toolkit.renderToSVG(page)).encode("utf-8"), filetype="svg")
+        pdf.insert_pdf(pymupdf.open("pdf", svg.convert_to_pdf()))
+    pdf.save(pdf_path)
+    return pdf.page_count
+
+
+def render_png(musicxml, zoom=1.0):
+    """PNG bytes of the whole score on one line, without title, cropped to the music."""
+    import pymupdf
+
+    toolkit = _load(musicxml, None, {
+        "scale": LIVE_SCALE, "breaks": "none", "adjustPageWidth": True, "adjustPageHeight": True,
+        "pageMarginLeft": LIVE_MARGIN, "pageMarginRight": LIVE_MARGIN,
+        "pageMarginTop": LIVE_MARGIN, "pageMarginBottom": LIVE_MARGIN,
+        "header": "none", "footer": "none", "spacingStaff": LIVE_STAFF_SPACING,
+    })
+    page = pymupdf.open(stream=_for_mupdf(toolkit.renderToSVG(1)).encode("utf-8"), filetype="svg")[0]
+    return page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False).tobytes("png")
+
+
+def _load(musicxml, title, options):
+    import verovio
+
+    toolkit = verovio.toolkit()
+    toolkit.setOptions(options)
     if title:
         musicxml = musicxml.replace("<work-title>Guitar</work-title>", f"<work-title>{title}</work-title>", 1)
     # The metronome's note symbol comes from a font MuPDF can't load; words print anywhere.
@@ -31,12 +60,7 @@ def render_pdf(musicxml, pdf_path, title=None):
                       r"<words>about \1 BPM</words>", musicxml)
     if not toolkit.loadData(musicxml):
         raise ValueError("Verovio could not read the MusicXML")
-    pdf = pymupdf.open()
-    for page in range(1, toolkit.getPageCount() + 1):
-        svg = pymupdf.open(stream=_for_mupdf(toolkit.renderToSVG(page)).encode("utf-8"), filetype="svg")
-        pdf.insert_pdf(pymupdf.open("pdf", svg.convert_to_pdf()))
-    pdf.save(pdf_path)
-    return pdf.page_count
+    return toolkit
 
 
 def _for_mupdf(svg):

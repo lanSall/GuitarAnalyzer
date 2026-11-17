@@ -1,13 +1,16 @@
-"""Real-time HMI: fretboard, per-string timeline, scrolling tab, spectrum and event log."""
+"""Real-time HMI: fretboard, per-string timeline, scrolling tab beside live sheet music, spectrum
+and event log."""
 import math
+import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -18,6 +21,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -35,6 +40,9 @@ GAUGES = [3.4, 2.8, 2.3, 1.8, 1.4, 1.1]
 TIMELINE_S = 8.0
 TICK_MS = 16
 AXIS_W = 56
+SHEET_BARS = 4
+SHEET_REFRESH_S = 0.3
+SHEET_ZOOM = 1.5
 
 STYLE = """
 QWidget { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI'; }
@@ -159,6 +167,40 @@ class FretboardWidget(QWidget):
             p.drawRect(QRectF(px, y + 2, bar_w * _norm_level(st.level_db), 5))
 
 
+class SheetView(QLabel):
+    """The latest bars as sheet music, scaled to fit while keeping their proportions."""
+
+    def __init__(self):
+        super().__init__("Sheet music appears here as you play")
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumWidth(200)
+        # The picture follows the panel's size, never the other way round.
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.setStyleSheet("QLabel { background: #f8fafc; color: #64748b; border-radius: 4px; }")
+        self.pixmap_full = None
+
+    def set_png(self, png):
+        pixmap = QPixmap()
+        if pixmap.loadFromData(png):
+            self.pixmap_full = pixmap
+            self._fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self):
+        if self.pixmap_full is not None:
+            self.setPixmap(self.pixmap_full.scaled(self.size() - QSize(8, 8), Qt.KeepAspectRatio,
+                                                   Qt.SmoothTransformation))
+
+
+def _live_sheet_png(musicxml):
+    from .sheet import render_png
+
+    return render_png(musicxml.replace("<part-name>Guitar</part-name>", "<part-name></part-name>"), SHEET_ZOOM)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, source, analyzer):
         super().__init__()
@@ -173,9 +215,14 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.addLayout(self._build_header())
         self.fretboard = FretboardWidget()
-        layout.addWidget(self.fretboard, 4)
+        layout.addWidget(self.fretboard, 3)
         layout.addWidget(self._build_timeline(), 3)
-        layout.addWidget(self._build_tab(), 2)
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(self._build_tab())
+        self.sheet = SheetView()
+        split.addWidget(self.sheet)
+        split.setSizes([1000, 1000])
+        layout.addWidget(split, 3)
         bottom = QHBoxLayout()
         bottom.addWidget(self._build_spectrum(), 1)
         self.log = QListWidget()
@@ -187,6 +234,11 @@ class MainWindow(QMainWindow):
         self.hist_lv = deque(maxlen=self.hist_t.maxlen)
         self.strike_items = {}
         self.tab_items = {}
+        # Engraving runs in its own process so it never holds up audio capture.
+        self.sheet_pool = None
+        self.sheet_job = None
+        self.sheet_shown = None
+        self.sheet_sent_at = 0.0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
 
@@ -331,6 +383,30 @@ class MainWindow(QMainWindow):
         for sid in [k for k, (_, t0) in self.strike_items.items() if t0 < now - TIMELINE_S - 1]:
             self.timeline.removeItem(self.strike_items.pop(sid)[0])
         self._update_tab(now)
+        self._update_sheet()
+
+    def _update_sheet(self):
+        """Show a finished engraving, and send the next one when the tab has changed."""
+        if self.sheet_job is not None:
+            if not self.sheet_job.done():
+                return
+            job, self.sheet_job = self.sheet_job, None
+            try:
+                self.sheet.set_png(job.result())
+            except Exception as exc:
+                self.sheet.setText(f"Sheet music unavailable: {exc}")
+                self.sheet_pool = False
+        tab = self.analyzer.tab
+        state = (len(tab.notes), sum(n.version for n in tab.notes[-64:]),
+                 tuple(n.end is None for n in tab.notes[-2:]))
+        if (self.sheet_pool is False or not tab.notes or state == self.sheet_shown
+                or time.monotonic() - self.sheet_sent_at < SHEET_REFRESH_S):
+            return
+        if self.sheet_pool is None:
+            self.sheet_pool = ProcessPoolExecutor(max_workers=1)
+        self.sheet_job = self.sheet_pool.submit(_live_sheet_png, tab.musicxml(last_bars=SHEET_BARS))
+        self.sheet_shown = state
+        self.sheet_sent_at = time.monotonic()
 
     def _update_tab(self, now):
         oldest = now - TIMELINE_S - 1
@@ -409,4 +485,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.timer.stop()
         self.source.stop()
+        if self.sheet_pool:
+            self.sheet_pool.shutdown(wait=False, cancel_futures=True)
         super().closeEvent(event)

@@ -128,7 +128,8 @@ class TabSession:
             lines += [rows[i] for i in reversed(range(6))] + [""]
         return "\n".join(lines)
 
-    def musicxml(self):
+    def musicxml(self, last_bars=None):
+        """The session as MusicXML; with last_bars, only that many bars from the end."""
         beat, placed = self._grid()
         events, pos = [], 0
         for start, length, note in placed:
@@ -159,7 +160,8 @@ class TabSession:
                     ties += (["stop"] if j else []) + (["start"] if j < len(chain) - 1 else [])
         if current:
             measures.append(current)
-        return _render_score(measures, 60 / beat, self.key_fifths())
+        first = max(len(measures) - last_bars, 0) if last_bars else 0
+        return _render_score(measures[first:], 60 / beat, self.key_fifths(), first + 1)
 
     def key_fifths(self):
         """Major key (as sharps > 0 / flats < 0) whose scale holds the most notes played,
@@ -224,7 +226,7 @@ def _note_xml(steps, note, ties, staff, voice, fifths):
     return "".join(out)
 
 
-def _render_score(measures, bpm, fifths=0):
+def _render_score(measures, bpm, fifths=0, first_number=1):
     tuning = "".join(
         f'<staff-tuning line="{i + 1}"><tuning-step>{NOTE_NAMES[m % 12][0]}</tuning-step>'
         f"<tuning-octave>{m // 12 - 1}</tuning-octave></staff-tuning>" for i, m in enumerate(OPEN_MIDI))
@@ -239,11 +241,11 @@ def _render_score(measures, bpm, fifths=0):
         f"<per-minute>{bpm:.0f}</per-minute></metronome></direction-type><staff>1</staff>"
         f'<sound tempo="{bpm:.0f}"/></direction>')
     body = []
-    for number, measure in enumerate(measures, 1):
+    for k, measure in enumerate(measures):
         staves = ["".join(_note_xml(steps, note, ties, staff, voice, fifths) for steps, note, ties in measure)
                   for staff, voice in STAVES]
         back = f"<backup><duration>{sum(steps for steps, _, _ in measure)}</duration></backup>"
-        body.append(f'<measure number="{number}">{attributes if number == 1 else ""}{back.join(staves)}</measure>')
+        body.append(f'<measure number="{first_number + k}">{attributes if k == 0 else ""}{back.join(staves)}</measure>')
     return ('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
             '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
             '"http://www.musicxml.org/dtds/partwise.dtd">\n'
