@@ -221,7 +221,7 @@ class _PacedSource(AudioSource):
 class SimulatedSource(_PacedSource):
     label = "Simulated guitar"
 
-    def __init__(self, sr=48000, seed=None, mistake_rate=0.25):
+    def __init__(self, sr=48000, seed=None, mistake_rate=0.0):
         super().__init__(sr)
         self.synth = GuitarSynth(sr, seed, mistake_rate)
         self._next_event = int(1.0 * sr)

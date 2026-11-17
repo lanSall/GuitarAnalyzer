@@ -187,7 +187,6 @@ class MainWindow(QMainWindow):
         self.hist_lv = deque(maxlen=self.hist_t.maxlen)
         self.strike_items = {}
         self.tab_items = {}
-        self.mistake_until = 0.0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
 
@@ -202,10 +201,7 @@ class MainWindow(QMainWindow):
         mid = QVBoxLayout()
         self.detail_label = QLabel("Play open strings one at a time. Low E should peak near the 82 Hz tick.")
         self.detail_label.setFont(QFont("Segoe UI", 13))
-        self.mistake_label = QLabel("")
-        self.mistake_label.setFont(QFont("Segoe UI", 13, QFont.Bold))
         mid.addWidget(self.detail_label)
-        mid.addWidget(self.mistake_label)
         header.addLayout(mid, 1)
 
         right = QVBoxLayout()
@@ -331,9 +327,6 @@ class MainWindow(QMainWindow):
         for ev in frame.events:
             self._handle_event(ev, now)
 
-        if self.mistake_until and now > self.mistake_until:
-            self.mistake_label.setText("")
-            self.mistake_until = 0.0
         for sid in [k for k, (_, t0) in self.strike_items.items() if t0 < now - TIMELINE_S - 1]:
             self.timeline.removeItem(self.strike_items.pop(sid)[0])
         self._update_tab(now)
@@ -381,21 +374,6 @@ class MainWindow(QMainWindow):
 
     def _handle_event(self, ev, now):
         latency_ms = (ev.detected_at - ev.time) * 1000
-        if ev.kind == "mistake":
-            color = QUALITY_COLORS[ev.quality]
-            self.mistake_label.setText(f"⚠ {ev.label}")
-            self.mistake_label.setStyleSheet(f"color: {color};")
-            self.mistake_until = now + 3.0
-            unsure = len(ev.strike_ids) > 1
-            for i, sid in ev.strike_ids.items():
-                if sid in self.strike_items:
-                    item = self.strike_items[sid][0]
-                    item.setColor(color)
-                    if unsure:
-                        item.setText(f"{ev.frets[i]}?")
-            self._log(f"{ev.time:7.2f}s  MISTAKE {ev.label}", color)
-            return
-
         self.chord_label.setText(self.analyzer.chord)
         self.detail_label.setText(f"{ev.label}    ·    shown {latency_ms:.0f} ms after the pluck")
         for sid in ev.dropped:

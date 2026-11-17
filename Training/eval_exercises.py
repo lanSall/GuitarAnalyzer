@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from data import take_half
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from guitar_hmi.analysis import DspAnalyzer
@@ -35,16 +37,17 @@ def recorded_takes(folder):
     for meta in sorted(Path(folder).rglob("*.json")):
         info = json.loads(meta.read_text(encoding="utf-8"))
         audio, sr = sf.read(meta.with_suffix(".wav"), dtype="float32", always_2d=True)
-        takes.append((f"{meta.parent.name}/{meta.stem}", audio[:, 0], sr, [tuple(n) for n in info["notes"]]))
+        takes.append((f"{meta.parent.name}/{meta.stem}", audio[:, 0], sr, [tuple(n) for n in info["notes"]], None))
     return takes
 
 
-def synthetic_takes(n, seed, sessions=None, notes_per_take=8, max_fret=5):
+def synthetic_takes(n, seed, sessions=None, half=None, notes_per_take=8, max_fret=5):
     """Let-ring sequences mixed from clean single-note clips of your guitar: each pluck lands
     0.45-1.0 s after the last, earlier notes keep ringing, and replucking a string cuts it."""
     rows = [r for r in csv.DictReader(open(ROOT / "dataset" / "labels.csv", encoding="utf-8"))
             if r["kind"] == "note" and r["quality"] == "clean" and int(r["fret"]) <= max_fret
-            and (not sessions or r["session"] in sessions)]
+            and (not sessions or r["session"] in sessions)
+            and (half is None or take_half(r["file"]) == half)]
     by_pos = {}
     for r in rows:
         by_pos.setdefault((int(r["string"]), int(r["fret"])), []).append(r)
@@ -72,12 +75,12 @@ def synthetic_takes(n, seed, sessions=None, notes_per_take=8, max_fret=5):
         fade = int(0.01 * sr)
         for k, (string, start, a) in enumerate(parts):
             later = [s for st, s, _ in parts[k + 1:] if st == string]
-            a = a[:int((later[0] - start) * sr) + fade].copy() if later else a
-            if later:
-                a[-fade:] *= np.linspace(1, 0, fade)
+            a = a[:int((later[0] - start) * sr) + fade].copy() if later else a.copy()
+            # Ending a clip abruptly clicks like a pluck; real strings fade.
+            a[-(fade if later else 10 * fade):] *= np.linspace(1, 0, fade if later else 10 * fade)
             i = int(start * sr)
             out[i:i + len(a)] += a[:len(out) - i]
-        takes.append((f"synthetic {t + 1}", out, sr, notes))
+        takes.append((f"synthetic {t + 1}", out, sr, notes, onsets))
     return takes
 
 
@@ -152,20 +155,23 @@ def main():
     ap.add_argument("--dir", default=str(ROOT / "dataset" / "exercises"), help="recorded exercises")
     ap.add_argument("--synthetic", type=int, default=0, help="score this many mixed sequences instead")
     ap.add_argument("--sessions", nargs="+", help="mix synthetic sequences only from these recording sessions")
+    ap.add_argument("--half", type=int, choices=[0, 1],
+                    help="mix synthetic sequences only from this half of the takes (see Training.py --exclude-half)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--analyzer", choices=["model", "dsp"], default="model")
     ap.add_argument("--model", default=str(ROOT / "models" / "string_model.pt"))
     ap.add_argument("--verbose", action="store_true", help="print every take's mistakes")
     args = ap.parse_args()
 
-    takes = synthetic_takes(args.synthetic, args.seed, args.sessions) if args.synthetic else recorded_takes(args.dir)
+    takes = (synthetic_takes(args.synthetic, args.seed, args.sessions, args.half) if args.synthetic
+             else recorded_takes(args.dir))
     if not takes:
         sys.exit(f"No exercises in {args.dir}; record some with record_exercise.py or use --synthetic N")
 
     stats = {c: Counter() for c in CONTEXTS}
     extra = 0
     echoed = 0
-    for name, audio, sr, expected in takes:
+    for name, audio, sr, expected, _ in takes:
         found = replay(audio, sr, make_analyzer(args.analyzer, sr, args.model))
         pairs, n_extra = align(expected, found)
         extra += n_extra
