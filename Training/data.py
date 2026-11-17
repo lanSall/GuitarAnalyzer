@@ -1,5 +1,6 @@
 """Labeled clips: reading labels.csv, grouping by guitar, splitting, and loading audio."""
 import csv
+import zlib
 from pathlib import Path
 
 import soundfile as sf
@@ -33,6 +34,12 @@ def load_rows(dataset_dir, max_fret=MAX_FRET, electric=False):
         r["string"], r["fret"] = int(r["string"]), int(r["fret"])
         r["group"] = r["session"] if r["session"].startswith("hf_") else "piezo"
     return [r for r in rows if r["fret"] <= max_fret and (electric or r["group"] not in ELECTRIC_GROUPS)]
+
+
+def take_half(file):
+    """0 or 1: a fixed split of the clips, so a model trained on one half can be scored on
+    sequences mixed from takes it never heard."""
+    return zlib.crc32(str(file).encode()) & 1
 
 
 def split_by_groups(rows, held_out):

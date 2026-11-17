@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from augment import augment, spec_augment
-from data import MAX_FRET, ROOT, TEST_GROUP, load_clips, load_rows, midi_of, split_by_groups
+from data import MAX_FRET, ROOT, TEST_GROUP, load_clips, load_rows, midi_of, split_by_groups, take_half
 from features import (FEATURE_S, N_HARMONIC_FEATURES, harmonic_stats, log_filterbank, spectrogram,
                       standardized_harmonics)
 from model import Fretboard, NoteNet
@@ -147,11 +147,15 @@ def main():
     ap.add_argument("--no-harmonics", dest="harmonics", action="store_false")
     ap.add_argument("--max-fret", type=int, default=MAX_FRET, help="ignore clips above this fret")
     ap.add_argument("--include-electric", action="store_true", help="also train on the electric HF guitars")
+    ap.add_argument("--exclude-half", type=int, choices=[0, 1],
+                    help="leave out this half of the own-guitar takes (score it with eval_exercises.py --half)")
     ap.add_argument("--save", type=Path, nargs="?", const=DEFAULT_MODEL,
                     help=f"train one model on every clip (seed = first of --seeds) and save it (default {DEFAULT_MODEL})")
     args = ap.parse_args()
 
     rows = [r for d in args.dataset for r in load_rows(d, args.max_fret, args.include_electric)]
+    if args.exclude_half is not None:
+        rows = [r for r in rows if r["group"] != "piezo" or take_half(r["file"]) != args.exclude_half]
     for i, r in enumerate(rows):
         r["idx"] = i
     clips = load_clips(rows)
@@ -159,10 +163,12 @@ def main():
 
     if args.save:
         started = time.perf_counter()
-        model, board, stats = train_fold(rows, clips, bank, args, args.seeds[0])
+        train = split_by_groups(rows, set(args.val_sessions))[0] if args.val_sessions else rows
+        model, board, stats = train_fold(train, clips, bank, args, args.seeds[0])
         save_model(args.save, model, board, stats, bank)
-        print(f"Trained on all {len(rows)} clips ({len(board.positions)} string/fret positions) in "
-              f"{time.perf_counter() - started:.0f} s; saved {args.save}")
+        held_out = f", without {', '.join(args.val_sessions)}" if args.val_sessions else ""
+        print(f"Trained on {len(train)} of {len(rows)} clips{held_out} ({len(board.positions)} string/fret "
+              f"positions) in {time.perf_counter() - started:.0f} s; saved {args.save}")
         return
 
     if args.test:

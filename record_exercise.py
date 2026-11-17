@@ -16,11 +16,14 @@ from datetime import datetime
 import numpy as np
 import soundfile as sf
 
-from guitar_hmi.analysis import OnsetDetector
+from guitar_hmi.analysis import FluxOnsetDetector
 from guitar_hmi.exercises import EXERCISES, ascii_tab
 from guitar_hmi.sources import LiveSource, RingBuffer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+# Farther apart than this and the earlier strings have faded, so the take no longer tests
+# notes over ringing strings.
+MAX_GAP_S = 2.0
 
 
 class Tape:
@@ -43,15 +46,16 @@ class Tape:
         return audio
 
 
-def count_plucks(audio, sr):
+def find_plucks(audio, sr):
+    """Pluck times in seconds, found the way the monitor finds them."""
     ring = RingBuffer(sr)
-    detector = OnsetDetector(sr)
+    detector = FluxOnsetDetector(sr)
     block = int(0.016 * sr)
-    found = 0
+    found = []
     for i in range(0, len(audio), block):
         ring.write(audio[i:i + block])
-        found += len(detector.scan(ring))
-    return found
+        found += detector.scan(ring)
+    return [f / sr for f in found]
 
 
 def main():
@@ -88,13 +92,19 @@ def main():
                     break
                 tape.take()
                 tape.armed = True
-                input("Recording. Play slowly and let every note ring; Enter when the last note has faded: ")
+                input("Recording. About one note per second, letting every note ring over the next; "
+                      "Enter when the last note has faded: ")
                 tape.armed = False
                 audio = tape.take()
                 peak = 20 * np.log10(np.max(np.abs(audio)) + 1e-9) if len(audio) else -120.0
-                heard = count_plucks(audio, args.sr)
+                plucks = find_plucks(audio, args.sr)
+                heard = len(plucks)
                 print(f"  {len(audio) / args.sr:.1f} s, peak {peak:.0f} dBFS, heard {heard} plucks "
                       f"(the exercise has {len(notes)})")
+                gap = float(np.median(np.diff(plucks))) if heard > 1 else 0.0
+                if gap > MAX_GAP_S:
+                    print(f"  Notes were {gap:.1f} s apart, so earlier strings had faded. "
+                          f"Redo it at about one note per second.")
                 if input("  Enter to keep, r to redo: ").strip().lower() == "r":
                     continue
                 stem = os.path.join(out_dir, f"{name}_t{take}")

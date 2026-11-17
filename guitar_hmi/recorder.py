@@ -145,17 +145,28 @@ def build_plan(mode, strings, fret_lo, fret_hi, chords, takes, counts, only_miss
     if shuffle:
         rng.shuffle(groups)
 
-    plan = []
+    per_group = []
     for pos, g in enumerate(groups, 1):
         key = (g["kind"], tab_string(g["frets"]), g["quality"])
         n = max(takes - counts.get(key, 0), 0) if only_missing else takes
         techniques = NOTE_TECHNIQUES if g["kind"] == "note" else CHORD_TECHNIQUES
         played = sorted(g["frets"])
+        prompts = []
         for k in range(n):
             p = Prompt(take=k + 1, takes=n, position=pos, technique=techniques[k % len(techniques)], **g)
             if g["kind"] == "chord" and p.quality != "clean":
                 p.mistake_string = played[k % len(played)]
-            plan.append(p)
+            prompts.append(p)
+        per_group.append(prompts)
+    if not shuffle:
+        return [p for prompts in per_group for p in prompts], len(groups)
+    # One take of every position per round, so each position is heard across the whole session
+    # (tone, gain and hand drift) instead of in one burst the model can tell apart by sound alone.
+    plan = []
+    for k in range(max((len(prompts) for prompts in per_group), default=0)):
+        round_ = [prompts[k] for prompts in per_group if k < len(prompts)]
+        rng.shuffle(round_)
+        plan += round_
     return plan, len(groups)
 
 
@@ -256,7 +267,7 @@ class RecorderWindow(QMainWindow):
 
         self.only_missing = QCheckBox("Only record what's still missing")
         self.only_missing.setChecked(True)
-        self.shuffle = QCheckBox("Shuffle position order")
+        self.shuffle = QCheckBox("Shuffle (mix positions through the session)")
         self.shuffle.setChecked(True)
         self.keep_failed = QCheckBox("Keep takes that fail the pitch check")
         for cb in (self.only_missing, self.shuffle, self.keep_failed):
@@ -461,8 +472,7 @@ class RecorderWindow(QMainWindow):
         if self.state not in ("listening", "paused", "cooldown"):
             return
         pos = self.plan[self.index].position
-        while self.index < len(self.plan) and self.plan[self.index].position == pos:
-            self.index += 1
+        self.plan = self.plan[:self.index] + [p for p in self.plan[self.index:] if p.position != pos]
         self.pause_btn.setText("Pause  [Space]")
         self._arm()
 

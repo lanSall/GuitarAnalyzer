@@ -13,26 +13,24 @@ from guitar_hmi.sources import GuitarSynth, RingBuffer
 
 
 def run(n_events, seed, sr=48000, tick_s=0.016, verbose=False):
-    synth = GuitarSynth(sr, seed)
+    synth = GuitarSynth(sr, seed, mistake_rate=0.0)
     ring = RingBuffer(sr)
     analyzer = DspAnalyzer(sr)
     rng = np.random.default_rng(seed)
     tick = int(tick_s * sr)
     next_event = sr
-    detections, mistakes = [], []
+    detections = []
     t0 = time.perf_counter()
     while len(synth.truth) < n_events or ring.total < next_event + sr:
         if ring.total >= next_event and len(synth.truth) < n_events:
             synth.trigger(ring.total)
             next_event = ring.total + int(rng.uniform(1.4, 2.6) * sr)
         ring.write(synth.render(tick))
-        for ev in analyzer.process(ring).events:
-            (mistakes if ev.kind == "mistake" else detections).append(ev)
+        detections += analyzer.process(ring).events
     elapsed = time.perf_counter() - t0
 
     stats = {k: [0, 0, 0] for k in ("note", "chord")}  # [count, pitch ok, string+fret ok]
     latency, matched = [], set()
-    m_stats = {"muted": [0, 0], "buzz": [0, 0]}  # [truth count, found]
     for truth in synth.truth:
         kind = "chord" if len(truth["frets"]) > 1 else "note"
         stats[kind][0] += 1
@@ -50,17 +48,6 @@ def run(n_events, seed, sr=48000, tick_s=0.016, verbose=False):
                 print(f"  truth {truth['label']:<40} got {d.label}")
         elif verbose:
             print(f"  MISSED {truth['label']}")
-        for s, q in truth["mistakes"].items():
-            m_stats[q][0] += 1
-            m_stats[q][1] += any(m.quality == q and abs(m.time - truth["time"]) < 0.1 for m in mistakes)
-
-    flagged_truth = {(round(t["time"], 1)) for t in synth.truth if t["mistakes"]}
-    false_flags = [m for m in mistakes if not any(abs(m.time - t["time"]) < 0.1 and t["mistakes"] for t in synth.truth)]
-    if verbose:
-        for m in false_flags:
-            truth = min(synth.truth, key=lambda t: abs(t["time"] - m.time))
-            print(f"  FALSE FLAG {m.label:<40} truth {truth['label']}")
-    false_flags = len(false_flags)
 
     audio_s = ring.total / sr
     print(f"{len(synth.truth)} events, {audio_s:.0f} s of audio analysed in {elapsed:.1f} s "
@@ -69,10 +56,6 @@ def run(n_events, seed, sr=48000, tick_s=0.016, verbose=False):
         if n:
             print(f"  {kind:<6} n={n:<4} pitch correct {pitch_ok / n:6.1%}   string+fret correct {exact_ok / n:6.1%}")
     print(f"  false detections: {len(detections) - len(matched)}")
-    for q, (n, found) in m_stats.items():
-        if n:
-            print(f"  {q:<6} recall {found}/{n}")
-    print(f"  mistake flags with no real mistake: {false_flags} (of {len(mistakes)} flags, {len(flagged_truth)} flawed events)")
     if latency:
         print(f"  latency onset->detection: mean {np.mean(latency) * 1000:.0f} ms, max {np.max(latency) * 1000:.0f} ms")
 

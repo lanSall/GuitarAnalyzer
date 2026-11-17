@@ -39,21 +39,16 @@ PRE_ONSET_S = 0.005
 # A note must get louder at the pluck. The live 82 Hz drone otherwise looks like
 # a permanent open low E, and its harmonics hide B and high E.
 RESTRIKE_RISE_DB = 6.0
+# Share of the spectrum just before a pluck taken off the one just after it before new pitches
+# are searched for, so strings that were already ringing neither hide nor impersonate the new note.
+RINGING_SUBTRACT = 1.0
 REL_SALIENCE = 0.35
 MAX_NOTES = 6
-MUTE_CHECK_AGE_S = 0.32
-# dB drop from peak that counts as a dead string. High E on a soundhole piezo
-# decays this much while still ringing; only a real mute falls farther.
-MUTE_DROP_DB = [18.0, 20.0, 22.0, 26.0, 32.0, 40.0]
 RELEASE_DROP_DB = 24.0
 SILENCE_DB = -72.0
-BUZZ_WINDOW_S = (0.22, 0.38)
 TRACK_HARMONICS = 6
 # Long enough to separate low notes a few semitones apart (E2-F2 is ~5 Hz).
 TRACK_WINDOW_S = 0.17
-BUZZ_BAND_HZ = (2500.0, 8000.0)
-BUZZ_BAND_DB = -38.0
-BUZZ_FLATNESS = 0.02
 HARMONIC_REL_SALIENCE = 0.5
 CHORD_SHAPE_BONUS = 0.02
 ABSENT_RATIO = 0.08
@@ -72,22 +67,19 @@ class StringState:
     level_db: float = -120.0
     peak_db: float = -120.0
     onset: float = -1.0
-    quality: str = "idle"  # idle | ringing | muted | buzz
+    quality: str = "idle"  # idle | ringing; the recorder also shows muted | buzz prompts
     strike_id: int = 0
-    mute_checked: bool = True
     harmonics: list = field(default_factory=list)
-    shadowed: bool = False  # every tracked harmonic is shared with another ringing string
 
 
 @dataclass
 class Event:
     time: float
     detected_at: float
-    kind: str  # "note" | "chord" | "mistake"
+    kind: str  # "note" | "chord"
     label: str
     frets: dict = field(default_factory=dict)
     strike_ids: dict = field(default_factory=dict)
-    quality: str = ""
     dropped: list = field(default_factory=list)  # strike ids this event shows were never played
 
 
@@ -289,6 +281,99 @@ class OnsetDetector:
         return onsets
 
 
+FLUX_N = 2048
+FLUX_HOP = 256
+FLUX_LAG = 2  # hops between the frames compared
+FLUX_BANDS_PER_OCTAVE = 24
+FLUX_RANGE_HZ = (60.0, 8000.0)
+FLUX_FLOOR_DB = -90.0
+FLUX_DELTA_DB = 2.0
+FLUX_HISTORY_S = 0.3
+USE_FLUX_ONSETS = True
+LOCATE_WITHIN_DB = 3.0
+# Flux also rises when the pick or finger first touches the string, up to ~90 ms before the
+# release; the attack is looked for in this much audio after the trigger.
+LOCATE_LOOKAHEAD_S = 0.1
+
+
+class FluxOnsetDetector:
+    """Flags plucks by energy appearing in frequency bands that were quieter a moment before
+    (spectral flux). A broadband level rise hides a soft pluck under strings that already
+    ring; the new note's own bands still jump."""
+
+    def __init__(self, sr, delta_db=None, refractory_s=REFRACTORY_S):
+        self.sr = sr
+        self.delta = FLUX_DELTA_DB if delta_db is None else delta_db
+        self.refractory = int(refractory_s * sr)
+        self.frame_len = max(int(0.004 * sr), 16)
+        freqs = np.fft.rfftfreq(FLUX_N, 1.0 / sr)
+        lo, hi = FLUX_RANGE_HZ
+        n_bands = int(FLUX_BANDS_PER_OCTAVE * np.log2(hi / lo))
+        band = np.floor(FLUX_BANDS_PER_OCTAVE * np.log2(np.maximum(freqs, 1e-9) / lo)).astype(int)
+        # Low bands narrower than one FFT bin merge into the bin's band.
+        self.bins = np.flatnonzero((band >= 0) & (band < n_bands))
+        self.starts = np.flatnonzero(np.r_[True, np.diff(band[self.bins]) > 0])
+        self.window = np.hanning(FLUX_N).astype(np.float32)
+        self.scale = 2.0 / self.window.sum()
+        self._next = None
+        self._prev = deque(maxlen=FLUX_LAG)
+        self._history = deque(maxlen=max(int(FLUX_HISTORY_S * sr / FLUX_HOP), 1))
+        self._armed = True
+        self._last_onset = -10 ** 12
+        self.lookahead = int(LOCATE_LOOKAHEAD_S * sr)
+        self._triggers = []
+
+    def _bands_db(self, x):
+        mag = np.abs(np.fft.rfft(x * self.window))[self.bins] * self.scale
+        return np.maximum(10.0 * np.log10(np.add.reduceat(mag * mag, self.starts) + 1e-20), FLUX_FLOOR_DB)
+
+    def _locate(self, ring, trigger):
+        """The attack near a flux trigger: the first 4 ms frame whose high-frequency energy
+        jumps as much as OnsetDetector needs, or, when ringing strings keep every jump smaller,
+        the first frame within LOCATE_WITHIN_DB of the biggest jump."""
+        fl = self.frame_len
+        start = trigger - (FLUX_N // fl) * fl
+        n = (trigger + self.lookahead - start) // fl
+        x = ring.get_range(start - 12 * fl - 1, start + n * fl)
+        e = 10.0 * np.log10(np.mean(np.diff(x).reshape(-1, fl) ** 2, axis=1) + 1e-12)
+        rise = np.array([e[k] - np.median(e[k - 12:k]) for k in range(12, len(e))])
+        sharp = rise >= ONSET_RISE_DB
+        k = np.argmax(sharp) if sharp.any() else np.argmax(rise >= rise.max() - LOCATE_WITHIN_DB)
+        # The end of that frame: pitch windows that start early mistake notes for the octave below.
+        return start + (int(k) + 1) * fl
+
+    def scan(self, ring):
+        """Onset sample indices found in audio that arrived since the last call."""
+        total = ring.total
+        if self._next is None:
+            self._next = total
+        self._next = max(self._next, total - self.sr)
+        onsets = []
+        while self._next <= total:
+            end = self._next
+            self._next += FLUX_HOP
+            bands = self._bands_db(ring.get_range(end - FLUX_N, end))
+            if len(self._prev) == FLUX_LAG:
+                ref = self._prev[0]
+                ref = np.maximum(ref, np.maximum(np.r_[ref[1:], ref[-1]], np.r_[ref[0], ref[:-1]]))
+                flux = float(np.mean(np.maximum(bands - ref, 0.0)))
+                base = float(np.median(self._history)) if self._history else flux
+                self._history.append(flux)
+                if flux - base > self.delta:
+                    if self._armed:
+                        self._armed = False
+                        self._triggers.append(end)
+                elif flux - base < 0.5 * self.delta:
+                    self._armed = True
+            self._prev.append(bands)
+        while self._triggers and self._triggers[0] + self.lookahead <= total:
+            onset = self._locate(ring, self._triggers.pop(0))
+            if onset - self._last_onset > self.refractory:
+                self._last_onset = onset
+                onsets.append(onset)
+        return onsets
+
+
 def _assign_harmonics(strings):
     """Track each ringing string on the harmonics no other ringing string shares."""
     active = [s for s in strings if s.active]
@@ -297,7 +382,6 @@ def _assign_harmonics(strings):
         others = np.concatenate(others) if others else np.empty(0)
         f = midi_to_hz(s.midi) * np.arange(1, TRACK_HARMONICS + 1)
         unique = [h for h in range(TRACK_HARMONICS) if not np.any(np.abs(others - f[h]) < 0.02 * f[h])]
-        s.shadowed = not unique
         s.harmonics = unique or list(range(TRACK_HARMONICS))
 
 
@@ -323,7 +407,8 @@ class DspAnalyzer:
         self.seg_bank = _HarmonicBank(sr, _pow2(self.seg_len) * 4, self.seg_len)
         self.display_mask = (self.track_bank.freqs >= 40.0) & (self.track_bank.freqs <= 5000.0)
         # Strums arriving before the first strike's analysis window closes are merged into it.
-        self.onsets = OnsetDetector(sr, refractory_s=max(REFRACTORY_S, ANALYSIS_WINDOW_S - PRE_ONSET_S))
+        detector = FluxOnsetDetector if USE_FLUX_ONSETS else OnsetDetector
+        self.onsets = detector(sr, refractory_s=max(REFRACTORY_S, ANALYSIS_WINDOW_S - PRE_ONSET_S))
         self._pending = []
         self._strikes = 0
         self.tab = TabSession()
@@ -334,19 +419,19 @@ class DspAnalyzer:
         now = total / self.sr
         events = []
         for onset in self.onsets.scan(ring):
-            self._pending.append((onset - self.pre_len + self.seg_len, "analyze", onset))
+            self._pending.append((onset - self.pre_len + self.seg_len, onset))
 
         due = sorted(p for p in self._pending if p[0] <= total)
         self._pending = [p for p in self._pending if p[0] > total]
-        for _, kind, onset in due:
-            ev = self._analyze_onset(ring, onset) if kind == "analyze" else self._check_buzz(ring, onset)
+        for _, onset in due:
+            ev = self._analyze_onset(ring, onset)
             if ev:
                 ev.detected_at = now
                 events.append(ev)
 
         x = ring.latest(self.track_len)
         mag = _spectrum(x, self.track_bank.nfft)
-        events += self._track(mag, now)
+        self._track(mag, now)
         input_db = 20.0 * np.log10(np.sqrt(np.mean(x * x)) + 1e-9)
         spec_db = 20.0 * np.log10(mag[self.display_mask] + 1e-9)
         return Frame(now, self.strings, events, self.chord, self.track_bank.freqs[self.display_mask], spec_db, input_db)
@@ -360,8 +445,10 @@ class DspAnalyzer:
         post = self.seg_bank.peaks(mag)
         pre = self.track_bank.peaks(_spectrum(ring.get_range(onset - self.track_len, onset), self.track_bank.nfft))
 
+        before = ring.get_range(onset - self.pre_len - self.seg_len, onset - self.pre_len)
+        new = np.maximum(mag - RINGING_SUBTRACT * _spectrum(before, self.seg_bank.nfft), 0.0)
         detected = [
-            m for m in _multi_pitch(self.seg_bank, mag)
+            m for m in _multi_pitch(self.seg_bank, new)
             if _level_db(post, m) - _level_db(pre, m) >= RESTRIKE_RISE_DB
         ]
         if not detected:
@@ -371,20 +458,17 @@ class DspAnalyzer:
 
         frets = self._assign(detected, mag)
         onset_s = onset / self.sr
-        for s in self.strings:
-            s.mute_checked = True
         strike_ids = {}
         for i, fret in frets.items():
             s = self.strings[i]
             self._strikes += 1
             s.active, s.fret, s.midi = True, fret, OPEN_MIDI[i] + fret
-            s.onset, s.quality, s.strike_id, s.mute_checked = onset_s, "ringing", self._strikes, False
+            s.onset, s.quality, s.strike_id = onset_s, "ringing", self._strikes
             strike_ids[i] = s.strike_id
         _assign_harmonics(self.strings)
         for i in frets:
             s = self.strings[i]
             s.level_db = s.peak_db = _level_db(post, s.midi, s.harmonics)
-            s.mute_checked = s.shadowed
 
         midis = [OPEN_MIDI[i] + f for i, f in frets.items()]
         heard = " ".join(note_name(m) for m in detected)
@@ -397,7 +481,6 @@ class DspAnalyzer:
             self.chord = note_name(midis[0])
             label = f"string {string_number(i)} fret {f}  ({self.chord})   heard {heard}"
             kind = "note"
-        self._pending.append((onset + int(BUZZ_WINDOW_S[1] * self.sr), "buzz", onset))
         self.tab.add(onset_s, frets, strike_ids)
         return Event(onset_s, 0.0, kind, label, frets, strike_ids)
 
@@ -477,54 +560,17 @@ class DspAnalyzer:
             notes.pop()
         return {}
 
-    def _check_buzz(self, ring, onset):
-        struck = [s for s in self.strings if s.active and abs(s.onset - onset / self.sr) < 1e-9]
-        if not struck:
-            return None
-        a, b = (int(onset + t * self.sr) for t in BUZZ_WINDOW_S)
-        seg = ring.get_range(a, b)
-        nfft = _pow2(len(seg))
-        power = _spectrum(seg, nfft) ** 2
-        freqs = np.fft.rfftfreq(nfft, 1.0 / self.sr)
-        band = (freqs >= BUZZ_BAND_HZ[0]) & (freqs <= BUZZ_BAND_HZ[1])
-        full = (freqs >= 60.0) & (freqs <= BUZZ_BAND_HZ[1])
-        band_db = 10.0 * np.log10(power[band].sum() / (power[full].sum() + 1e-20) + 1e-20)
-        pb = power[band] + 1e-20
-        flatness = float(np.exp(np.mean(np.log(pb))) / np.mean(pb))
-        if band_db < BUZZ_BAND_DB or flatness < BUZZ_FLATNESS:
-            return None
-        if len(struck) == 1:
-            s = struck[0]
-            if s.quality == "ringing":
-                s.quality = "buzz"
-            label = f"BUZZ on string {string_number(s.index)} (fret {s.fret})"
-        else:
-            label = f"BUZZ in {self.chord} (string not identified)"
-        return Event(onset / self.sr, 0.0, "mistake", label, {s.index: s.fret for s in struck},
-                     {s.index: s.strike_id for s in struck}, "buzz")
-
     # ---------------------------------------------------------- continuous
     def _track(self, mag, now):
-        events = []
+        """Follow each ringing string's level and release it once it has died away."""
         peaks = self.track_bank.peaks(mag)
         for s in self.strings:
             if not s.active:
                 continue
             s.level_db = _level_db(peaks, s.midi, s.harmonics)
-            age = now - s.onset
-            if age < 0.12:
+            if now - s.onset < 0.12:
                 s.peak_db = max(s.peak_db, s.level_db)
-            silent = s.level_db < SILENCE_DB or s.level_db < s.peak_db - RELEASE_DROP_DB
-            if not s.mute_checked and (age >= MUTE_CHECK_AGE_S or silent):
-                s.mute_checked = True
-                # Going quiet is not enough: treble notes on this pickup fade fast.
-                if s.peak_db - s.level_db > MUTE_DROP_DB[s.index]:
-                    s.quality = "muted"
-                    events.append(Event(s.onset, now, "mistake",
-                                        f"MUTED string {string_number(s.index)} (fret {s.fret})",
-                                        {s.index: s.fret}, {s.index: s.strike_id}, "muted"))
-            if silent:
+            if s.level_db < SILENCE_DB or s.level_db < s.peak_db - RELEASE_DROP_DB:
                 s.active, s.quality = False, "idle"
                 self.tab.release(s.strike_id, now)
                 _assign_harmonics(self.strings)
-        return events

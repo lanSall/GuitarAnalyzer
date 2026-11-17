@@ -1,6 +1,6 @@
 """DspAnalyzer with trained models and a fingering tracker choosing strings for tab.
 
-The DSP still detects plucks, pitch, mutes and buzz, and shows each note right away. About
+The DSP still detects plucks and pitch, and shows each note right away. About
 250 ms after a pluck:
 
 - single notes: the string model gives a probability for each string that can play that pitch
@@ -8,7 +8,7 @@ The DSP still detects plucks, pitch, mutes and buzz, and shows each note right a
   are together, and may move this note or a recent one to another string.
 - chords: the chord model (models/chord_model.pt, Training/train_chords.py) if one is saved,
   otherwise the chord fitter (guitar_hmi/chord_fit.py), replaces the DSP's note-by-note guess
-  with a whole playable shape. The fitter also flags shape strings that barely sound.
+  with a whole playable shape.
 
 The fretboard, timeline and tab follow every change. Notes the string model was not trained on
 (above its highest fret) keep the DSP's placement and only give the tracker context, as do
@@ -44,9 +44,9 @@ class _FitterChords:
         self.fitter = ChordFitter(path, group="piezo")
 
     def detect(self, clip, onset_index):
-        """(frets, how sure, strings in the shape that barely sound) or None."""
+        """(frets, how sure) or None."""
         fit = self.fitter.fit(clip, onset_index)
-        return None if fit is None else (fit.frets, f"shape fit {fit.explained:.0%}", fit.silent)
+        return None if fit is None else (fit.frets, f"shape fit {fit.explained:.0%}")
 
 
 class _ModelChords:
@@ -59,7 +59,7 @@ class _ModelChords:
 
     def detect(self, clip, onset_index):
         frets, _, joint = self.predictor.predict(clip)
-        return (frets, f"chord model {joint:.0%}", []) if frets else None
+        return (frets, f"chord model {joint:.0%}") if frets else None
 
 
 class ModelAnalyzer(DspAnalyzer):
@@ -177,16 +177,13 @@ class ModelAnalyzer(DspAnalyzer):
         if found is None:
             self._revise(self.fingering.add_fixed(note_id, note.time, note.frets), None)
             return
-        frets, sureness, silent = found
+        frets, sureness = found
         dsp, old_strikes = dict(note.frets), dict(note.strikes)
         if frets == dsp:
             strike_ids = old_strikes
         else:
             strike_ids = self._restrike(ring, note, frets, now)
             self.tab.update(note_id, frets, strike_ids)
-        for i, sid in strike_ids.items():
-            if self.strings[i].strike_id == sid:
-                self.strings[i].mute_checked = True  # the fit's silent strings replace the DSP mute check
 
         name = chord_name(frets)
         if note is self.tab.notes[-1]:
@@ -195,12 +192,6 @@ class ModelAnalyzer(DspAnalyzer):
         dropped = [sid for sid in old_strikes.values() if sid not in strike_ids.values()]
         self._revisions.append(Event(note.time, 0.0, "chord", f"{name}  {tab_string(frets)}   {sureness}, {verdict}",
                                      dict(frets), strike_ids, dropped=dropped))
-        for i in silent:
-            if self.strings[i].strike_id == strike_ids[i]:
-                self.strings[i].quality = "muted"
-            self._revisions.append(Event(note.time, 0.0, "mistake",
-                                         f"MUTED string {string_number(i)} (fret {frets[i]}) in {name}",
-                                         {i: frets[i]}, {i: strike_ids[i]}, "muted"))
         self._revise(self.fingering.add_fixed(note_id, note.time, frets), None)
 
     def _restrike(self, ring, note, frets, now):
